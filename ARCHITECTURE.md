@@ -134,7 +134,17 @@ short, **linked** overview that ties related work together. `HybridCompactor`
   a near-verbatim view of the (bounded) input instead of compressing into a saturating
   fixed state. Cost: a **growing** KV cache (94→156 MB in the sweep), bounded only
   *because the input is the BE-capped set* — that cap is exactly what makes a hybrid safe
-  here. Evidence: `scripts/hybrid_stage2.py`, `scripts/hybrid_stage3_link.py`.
+  here.
+
+**Measured** (Falcon-H1-3B-Instruct, fp16, RTX 5070 Ti — the deployed gist model):
+
+| Finding | Result | Evidence |
+|---------|--------|----------|
+| Loads kernel-free on Blackwell | 3.2 s; **~6.3 GB** VRAM weights — half the 7B's ~14 GB | `scripts/hybrid_probe.py` |
+| **Never collapses under load** | coherent, format-clean board at **2600 tok**, where pure Mamba degrades to `[x]`×78 garbage | `scripts/hybrid_stage2.py` |
+| Footprint is the trade-off | attention KV grows **94 → 156 MB** across the depth sweep (vs Mamba's flat ~21 MB), bounded by the capped input | `scripts/hybrid_stage2.py` |
+| Throughput | **~17.5 tok/s** on the kernel-free naive fallback | `scripts/hybrid_probe.py` |
+| Links, doesn't fabricate | ties an explicitly-stated cross-project dependency; would hallucinate if asked to *hunt* deps → the prompt forbids it (verified) | `scripts/hybrid_stage3_link.py`, `scripts/compact_demo.py` |
 
 ### 6b. The constant-size streaming carry — the O(1) firehose primitive (pure Mamba → `project_digests`)
 
@@ -151,7 +161,8 @@ fades as new folds in — anti-poisoning by decay, no judgment).
   project* (report finding 5: recall scales with state-per-stream), so each stream stays
   under the faithful envelope and a hot-project revert replays only *that* shard — the
   first lever to reach for, before a bigger-state model.
-- **Measured** (falcon-mamba-7b-instruct, fp16, RTX 5070 Ti):
+- **Measured** (falcon-mamba-7b-instruct — the *benchmark baseline* for this role, not a
+  deployment target; fp16, RTX 5070 Ti):
 
 | Finding | Result | Evidence |
 |---------|--------|----------|

@@ -19,14 +19,7 @@ from __future__ import annotations
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-_PROMPT = (
-    "You maintain a concise shared status board for a small dev team.\n"
-    "Current status:\n{state}\n\n"
-    "New event from {author} ({type}): {body}\n\n"
-    "Rewrite the status to fold in this event in <= 120 words. Keep every "
-    "still-relevant fact, note who owns what, and flag any apparent overlap. "
-    "Drop nothing essential.\nUpdated status:\n"
-)
+from ctx.prompts import FOLD_PROMPT as _PROMPT
 
 
 class MambaSummarizer:

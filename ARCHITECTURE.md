@@ -2,8 +2,9 @@
 
 How Context_Manager is built and *why* it's shaped this way. The README is the
 one-screen north star; this is the design rationale, including the empirical results
-that pushed each decision. For the cited SSM/hybrid research record see
-[`research/deep_research_report.md`](research/deep_research_report.md).
+that pushed each decision. The model-backed cache layer was explored and archived; that
+arc is recorded in [`research/SSM_POSTMORTEM.md`](research/SSM_POSTMORTEM.md) (with the
+underlying survey in [`research/deep_research_report.md`](research/deep_research_report.md)).
 
 ---
 
@@ -33,17 +34,20 @@ These are load-bearing; violating one is how the design drifts.
 1. **Truth lives in the DB, never in a model's context.**
 2. **Every input is an update.** The streaming model folds *all* updates; it never
    decides which are real, true, or important.
-3. **Exact retraction = the DB** (explicit supersede/revert). **Lossy fade of the
-   merely-old = the cache** (recency decay in the streaming carry, compaction in the
-   gist). Complementary, not redundant.
+3. **Exact retraction = the DB** (explicit supersede/revert). There is no separate
+   "fade" tier: because retraction prunes the active set, the current state is always
+   clean — there is no stale soup left over to decay past.
 4. **Judgment = Claude or a deterministic rule** (dedup, conflict, merge, salience).
-   **Never the SSM** — comparison is its architectural weakness (see §6).
+   **Never the model** — *the SSM compresses, it does not compare.* This is the
+   load-bearing survivor of the archived cache exploration: every framing that asked a
+   fixed lossy state to *make a call* failed the same way (§6 and
+   [`research/SSM_POSTMORTEM.md`](research/SSM_POSTMORTEM.md)).
 5. **The cache is derived and lossy; the DB is exact.** "Dropped" never means "lost":
    overview → active set → full log, each layer drills down to the one below.
 
 ---
 
-## 3. Component stack (DB / BE / cache / FE)
+## 3. Component stack (DB / BE / FE + Claude)
 
 ```
   Your CC ──┐            ┌── Boss's CC        (consumers: the CC sessions + humans)
@@ -51,8 +55,7 @@ These are load-bearing; violating one is how the design drifts.
             └──────┬──────┘
              DEV MACHINE
   ┌───────────────────────────────────────────────────────────┐
-  │ FE     display: exact board  |  or the gist                 │  what a consumer reads
-  │ CACHE  lossy linking gist + O(1) streaming carry (dual)      │  derived, lossy, optional
+  │ FE     display: the exact board                              │  what a consumer reads
   │ BE     index / service — query, shape, render (deterministic)│  structured, GPU-free
   │ DB     store — source of truth; clean retraction             │  append log + active state
   └───────────────────────────────────────────────────────────┘
@@ -63,9 +66,12 @@ These are load-bearing; violating one is how the design drifts.
 |-------|--------|-----|--------------|
 | DB    | `ctx/store.py` | source of truth | exact, append-only + retractable |
 | BE    | `ctx/index.py`, `ctx/service.py` | query/shape/render | deterministic, GPU-free |
-| cache | `ctx/compaction.py`, `ctx/ssm_engine.py`, `ctx/mamba_summarizer.py` | lossy linking gist (hybrid) + O(1) streaming carry (Mamba) | derived, lossy, optional |
-| FE    | the board string / a CC / a human | display | exact *or* glanceable |
+| FE    | the board string / a CC / a human | display | exact, verbatim store text |
 | judge | Claude (in the CC sessions) | dedup / conflict / merge | on demand, not hosted here |
+
+The model-backed cache (`ctx/compaction.py`, `ctx/ssm_engine.py`,
+`ctx/mamba_summarizer.py`) was explored and archived — see §6 and
+[`research/SSM_POSTMORTEM.md`](research/SSM_POSTMORTEM.md).
 
 ---
 
@@ -103,94 +109,33 @@ fact vanishes on revert; a supersede→revert flips the board back to the origin
 
 ---
 
-## 6. The model-backed cache — two roles over the exact core
+## 6. Explored and archived: the model-backed cache
 
-The DB + BE already deliver the live product *deterministically and GPU-free*: the
-verbatim board needs no model. Everything here is an **optional readout layer on top**
-of that exact core — derived, lossy, never the truth (Principle 5), with the DB always
-the fallback for exact. And it is **not one model doing one thing**: a hybrid probe this
-cycle (`scripts/hybrid_stage2.py`) split it into two roles with different mechanics,
-footprints, and jobs — the readable *gist* most consumers actually reach for, and the
-constant-cost *streaming carry* for an unbounded firehose. Cited record:
-`research/deep_research_report.md`.
+For one cycle we explored a **model-backed cache** on top of the exact core — an SSM
+(or a small SSM/attention hybrid) as a constant-size, always-fresh readout of "where are
+we." Four framings were tried: the SSM as **store**, as **salience picker**, as a lossy
+linking **gist**, and as a **drift detector**. Every one hit the same wall, the one law
+of this exploration:
 
-### 6a. The lossy compaction gist — the readable "where are we" (`Falcon-H1-3B` → `overview`)
+> **The SSM compresses; it does not compare.**
 
-What a consumer (a human, or another CC) usually wants: not a verbatim relist but a
-short, **linked** overview that ties related work together. `HybridCompactor`
-(`ctx/compaction.py`) feeds the BE's *capped* verbatim board into a small SSM/attention
-**hybrid** and compacts it into that gist.
+Store, salience, and drift each secretly asked a fixed lossy state to hold itself up
+against a criterion and *make a call* — reasoning, which is Claude's job (Principle 4). A
+fixed lossy state has nowhere to run a comparison; the one thing it genuinely does — fold
+a stream into a lossy state and read it back — is real but narrow.
 
-- **Lossy is the point, not a defect.** It paraphrases, groups, and drops detail *by
-  design* — exact recall is the DB's job (Principle 5). Its job is to *link* facts into a
-  glanceable picture; judging it on verbatim recall grades it against the wrong job.
-- **It links only what the board states.** A linking probe (`scripts/hybrid_stage3_link.py`)
-  showed that *inviting* it to hunt dependencies makes it hallucinate false ones, so the
-  prompt forbids speculation — it connects an explicit reference (one entry reads
-  another's output), never an inferred one. LINK ≠ JUDGE (Principle 4): it synthesizes
-  what it is *given*; truth, salience, and conflict stay the DB's and Claude's.
-- **It degrades gracefully.** Where a pure Mamba *collapses* past its envelope into
-  garbage, the hybrid keeps emitting a coherent, format-clean board — its attention holds
-  a near-verbatim view of the (bounded) input instead of compressing into a saturating
-  fixed state. Cost: a **growing** KV cache (94→156 MB in the sweep), bounded only
-  *because the input is the BE-capped set* — that cap is exactly what makes a hybrid safe
-  here.
+The single framing that *worked* was the hybrid gist (Falcon-H1-3B): it compacts the
+capped board into a readable, linked overview and never collapses. We archived it anyway,
+because at this scale it is a bad trade — it spends ~6 GB resident VRAM to produce a
+*lossy* view of a set the deterministic BE already renders *exactly and for free*, and the
+subtle-judgment cases it cannot cover fall back to Claude, who is already in the loop.
+Working was never the bar; worth-it was. The code stays in-tree as the record
+(`ctx/compaction.py`, `ctx/ssm_engine.py`, `ctx/mamba_summarizer.py`, `scripts/*`), off by
+default and unwired from the live path.
 
-**Measured** (Falcon-H1-3B-Instruct, fp16, RTX 5070 Ti — the deployed gist model):
-
-| Finding | Result | Evidence |
-|---------|--------|----------|
-| Loads kernel-free on Blackwell | 3.2 s; **~6.3 GB** VRAM weights — half the 7B's ~14 GB | `scripts/hybrid_probe.py` |
-| **Never collapses under load** | coherent, format-clean board at **2600 tok**, where pure Mamba degrades to `[x]`×78 garbage | `scripts/hybrid_stage2.py` |
-| Footprint is the trade-off | attention KV grows **94 → 156 MB** across the depth sweep (vs Mamba's flat ~21 MB), bounded by the capped input | `scripts/hybrid_stage2.py` |
-| Throughput | **~17.5 tok/s** on the kernel-free naive fallback | `scripts/hybrid_probe.py` |
-| Links, doesn't fabricate | ties an explicitly-stated cross-project dependency; would hallucinate if asked to *hunt* deps → the prompt forbids it (verified) | `scripts/hybrid_stage3_link.py`, `scripts/compact_demo.py` |
-
-### 6b. The constant-size streaming carry — the O(1) firehose primitive (pure Mamba → `project_digests`)
-
-The original SSM value, and still the only thing that does it: fold an **unbounded,
-high-frequency** stream at **constant memory and constant cost**, where the fixed state
-it keeps *is already* the current "where are we." The DB appends O(1) too, but its
-readout is O(N active); a pure Mamba is **O(1) in and out**, recency-fresh for free (old
-fades as new folds in — anti-poisoning by decay, no judgment).
-
-- **Mechanism.** Each event folds once into the recurrent state (`cache_params` = conv +
-  recurrent states); an exact revert re-syncs by replaying the affected tail from the
-  nearest checkpoint (`ctx/ssm_engine.py`), never by asking the model to un-remember.
-- **Sharding is the envelope lever.** `ShardedSSMEngine` keeps one fold state *per
-  project* (report finding 5: recall scales with state-per-stream), so each stream stays
-  under the faithful envelope and a hot-project revert replays only *that* shard — the
-  first lever to reach for, before a bigger-state model.
-- **Measured** (falcon-mamba-7b-instruct — the *benchmark baseline* for this role, not a
-  deployment target; fp16, RTX 5070 Ti):
-
-| Finding | Result | Evidence |
-|---------|--------|----------|
-| State is fixed-size | **~21 MB**, identical for 775 vs 2464 input tokens | `scripts/state_decode.py` |
-| Faithful envelope | clean ≤ ~1000 tok / ~25 entries; conflates ~1150; garbles ~1300+ | `scripts/knee_sweep.py` |
-| Streaming == batch | byte-identical readout, **zero drift**; live query at any mid-stream point | `scripts/streaming_test2.py` |
-| Recency bias | old facts fade first as the state saturates | knee sweep |
-| **Selection/judgment** | **rejected — 0/3**: asked to pick load-bearing entries it just copies input order, ignoring intent | `scripts/salience_select.py` |
-
-- **Honest limit.** Past ~25 entries / ~1k tokens the fixed state saturates and
-  **collapses** (2600 tok → runaway `[x]` garbage in the sweep) — exactly why capping +
-  sharding matter here, and why the gist (6a), which never collapses, is the better fit
-  for a *readable* overview. The one lever for a bigger faithful envelope is a **bigger
-  state** (larger-`d_state` SSM); 6a sidesteps the wall by not compressing into a fixed
-  state at all.
-
-### Shared boundaries (both roles)
-
-Both inherit the same limits (deep-research report, confirmed): no random access → exact
-recall is the DB's; capacity-bounded → the DB is the archive; **cannot judge** →
-salience/dedup/conflict is Claude's or a deterministic rule's (Principle 4; the rejected
-`salience_select.py`, 0/3). Neither role is ever the source of truth — the gist and the
-streaming state are both derived views the DB can always reconstruct.
-
-**Status.** The DB + BE are the deterministic product today. Both model roles are **wired
-but optional**: MCP `overview` (the gist, `CTX_GIST=1`) and `project_digests` (sharded
-streaming, `CTX_SSM=1`), each lazy-loaded on the dev-machine GPU with a deterministic
-board fallback — they compete for VRAM on a 16 GB box, so enable one.
+The full arc — every framing, the measured envelopes and VRAM footprints, the sharding
+lever, and the drift probe — is in
+[`research/SSM_POSTMORTEM.md`](research/SSM_POSTMORTEM.md).
 
 ---
 
@@ -217,12 +162,13 @@ All deterministic and GPU-free (`ctx/service.py`, `ctx/index.py`):
 ## 8. Interface & topology (the MCP server)
 
 `ctx/mcp_server.py` is a thin FastMCP HTTP adapter over `ContextService`, stateless
-(`stateless_http=True`) because all state lives in the DB. Deterministic tools:
-`publish`, `status_board`, `check_overlap`, `supersede`, `revert`, `team_state`,
-`recent`. Optional GPU-backed reads (off by default; enable on the dev machine):
-`overview` (the lossy linking gist, `CTX_GIST=1`) and `project_digests` (per-project
-streaming digests, `CTX_SSM=1`) — each lazy-loads its model and falls back to the
-verbatim board, and the two compete for VRAM on a 16 GB box.
+(`stateless_http=True`) because all state lives in the DB. The live server is fully
+**deterministic and GPU-free** — seven tools: `publish`, `status_board`, `check_overlap`,
+`supersede`, `revert`, `team_state`, `recent`. Two GPU-backed reads remain wired but are
+**archived experiments, off by default** — `overview` (the hybrid gist, `CTX_GIST=1`) and
+`project_digests` (per-project streaming digests, `CTX_SSM=1`); they are the experimental
+record (§6, [`research/SSM_POSTMORTEM.md`](research/SSM_POSTMORTEM.md)), not part of the
+live surface.
 
 ```
   kevin's box (CC)  ──http──┐
@@ -243,29 +189,22 @@ The working loop, per box (set in each box's `CLAUDE.md`): **read the board →
 - **BE** — verbatim board, driver/attribution, envelope + surfaced overflow, file-ref
   overlap (`tests/test_index.py`, `tests/test_service.py`). **69 tests green, GPU-free**
   (incl. prompt-invariant, sharding, compaction, and wiring guards).
-- **MCP** — the deterministic tools live over streamable-HTTP, overlap warning + board
-  over the wire (`scripts/verify_mcp.py`); the optional `overview`/`project_digests`
-  reads are wired with a deterministic fallback.
-- **SSM cache** — fixed state, faithful envelope, zero-drift streaming, revert re-sync
-  (scripts in §6); **per-project sharding** (`ShardedSSMEngine`); **selection explicitly
-  disproven**.
-- **Hybrid compaction gist** — `Falcon-H1-3B` runs kernel-free on Blackwell, compacts +
-  links the capped board without collapsing, links only stated relations (no
-  speculation); verified end-to-end (`scripts/hybrid_stage2.py`,
-  `scripts/hybrid_stage3_link.py`, `scripts/compact_demo.py`).
+- **MCP** — the seven deterministic tools live over streamable-HTTP, overlap warning +
+  board over the wire (`scripts/verify_mcp.py`).
+- **Explored and archived (not a live capability)** — the model-backed cache: fixed-state
+  streaming, per-project sharding, and the hybrid compaction gist all *ran* on Blackwell,
+  but each hit "the SSM compresses, it does not compare," and the one working piece was a
+  bad VRAM trade. The full arc and measured numbers are in
+  [`research/SSM_POSTMORTEM.md`](research/SSM_POSTMORTEM.md).
 
 ---
 
 ## 10. Open questions (candidates, not commitments)
 
-From `research/deep_research_report.md` — pick *from* these, don't do all of them:
+The model-backed probes are closed — sharding, the bigger-state lever, the same-size
+hybrid test, and the mechanism question are all retired with the cache exploration (see
+[`research/SSM_POSTMORTEM.md`](research/SSM_POSTMORTEM.md)). What remains is on the live
+deterministic path:
 
-- ~~**Shard SSM state by project**~~ — **done** (`ShardedSSMEngine`, §6).
-- **Bigger state, not bigger model** (Mamba-2 `d_state`, RWKV-7) as the envelope lever —
-  still the honest lever for role (i); the hybrid gist is the answer for role (ii).
-- **Same-size hybrid vs pure test** (e.g. mamba-2.8b vs a 2.8B hybrid) to cleanly settle
-  the report's mechanism claim — the shipped 3B-hybrid-vs-7B-Mamba comparison confounds
-  size (it answered the *swap* decision, not the mechanism).
-- **Δ carries real elapsed time** so recency-fade tracks wall-clock, not event count.
 - **Wire the Claude judgment tier** (dedup / conflict escalation) — the last core gap.
 ```

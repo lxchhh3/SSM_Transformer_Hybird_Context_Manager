@@ -21,7 +21,7 @@ head, where it can't be cleanly retracted and can't be shared*:
 that (a) retracts exactly, (b) is shared, (c) always yields a clean current state.
 Each CC pulls clean truth instead of trusting its own polluted/partial context.
 
-## The stack (DB / BE / cache / FE)
+## The stack (DB / BE / FE)
 
 ```
   Your CC ──┐            ┌── Boss's CC        (consumers: the CC sessions…
@@ -29,8 +29,7 @@ Each CC pulls clean truth instead of trusting its own polluted/partial context.
             └──────┬──────┘
              DEV MACHINE
   ┌───────────────────────────────────────────────────────────┐
-  │ FE     display: the exact board  |  or the SSM gist         │ what a consumer reads
-  │ CACHE  SSM — constant-size, always-fresh "where are we"      │ O(1) in AND out; recency-fresh
+  │ FE     display: the exact verbatim board                    │ what a consumer reads
   │ BE     index / service — query, shape, render (deterministic)│ structured, GPU-free, exact
   │ DB     store — the source of truth; clean retraction         │ append-only log + active state
   └───────────────────────────────────────────────────────────┘
@@ -44,68 +43,59 @@ Each CC pulls clean truth instead of trusting its own polluted/partial context.
   DB: group by project, name the driver, cap to the envelope, and render a **verbatim**
   board (store text only → a model can't hallucinate into it). Serves scoped queries
   cheaply via structured keys.
-- **CACHE — the SSM (`ctx/mamba_summarizer.py` + engine).** A compact, lossy, always-
-  fresh *materialized view* of the update stream. Derived, never the truth — you fall
-  back to the DB for exact. Earns its seat at scale (see "the SSM's job" below).
-- **FE.** Whatever displays a view: the exact board for drill-down, or the SSM's gist
-  for a human glance. The consumer is often another CC (likes structure) — sometimes
-  a human (wants the readable overview).
+- **FE.** Whatever displays the board — usually another CC (likes structure), sometimes
+  a human. Always exact store text.
+- **Claude — judgment, on demand.** Dedup, conflict, merge — the reasoning calls, made by
+  the CC when it needs them. Not hosted here.
+
+> **A model-backed cache (SSM / hybrid gist) was explored and archived** — it is *not*
+> part of this stack. It worked, but wasn't worth the resident VRAM at this scale: the
+> store is exact and free, and judgment is Claude's. Record + measured results:
+> [`research/SSM_POSTMORTEM.md`](research/SSM_POSTMORTEM.md).
 
 ## Invariants (the load-bearing rules — don't blur these)
 
 - **Truth lives in the DB, never in a model's context.**
-- **Every input is an update.** The SSM folds *all* updates into its state; it never
-  decides which are real, true, or important.
-- **Exact retraction = the DB** (explicit supersede/revert). **Graceful fade of the
-  merely-old = the SSM** (recency decay). Complementary.
+- **Every input is an update to the log.** The store records each publish / supersede /
+  revert; nothing decides *on ingest* which are real, true, or important.
+- **Exact retraction = the DB** (explicit supersede/revert) — the active set is always
+  clean, so there is no stale soup to reason over.
 - **Judgment = Claude or a deterministic structured rule** (dedup, conflict, merge,
-  salience/priority). **Never the SSM** — comparison is its architectural weakness,
-  confirmed repeatedly. See `memory/ssm-never-judges.md`.
-- **The cache is derived and lossy; the DB is exact.** Dropped never means lost —
-  overview → active set → full log, each one drill-down recovers the layer below.
+  salience/priority). **Never a model-in-the-loop cache** — reasoning is not an SSM's
+  job: *it compresses, it does not compare*, confirmed across four probes
+  (`research/SSM_POSTMORTEM.md`, `memory/ssm-never-judges.md`).
+- **The board is derived from the log; the DB is exact.** A dropped fact is gone from the
+  active set, recoverable from the full log — active set → full log, drill down.
 
-## The SSM's job — and its honest limit
+## What we explored and archived — the model-backed cache
 
-**Pro (why it's here, and what a transformer cannot do):** an SSM ingests an
-unbounded, high-frequency, ever-changing stream at **constant memory and constant
-cost**, and the fixed state it keeps *is already* the compressed, always-current
-"where are we." The store appends O(1) too, but its *readout* is O(N active entries);
-the SSM is **O(1) in and out**, and **recency-fresh for free** (old fades as new folds
-in — anti-poisoning by decay, no judgment). That constant-size readout of an endless
-stream is the differentiated value.
-
-**Limit (measured):** the fixed state is *faithful* only within a **~25-entry /
-~1k-token envelope**; past that it saturates and the gist garbles. So "how big a fresh
-view can I hold" is exactly the axis a **bigger-state model** buys — self-host a larger
-SSM to keep it local + constant-cost, or narrate with Claude if cloud is acceptable.
-
-**Rule of thumb:** small/medium project → DB + BE alone are cheap and exact; the SSM is
-optional. Large live surface area (feeding the active set verbatim gets expensive) →
-the constant-size SSM cache earns its seat, and wants a bigger state to stay faithful.
+We spent a research cycle testing whether a state-space model could be a **constant-size,
+always-fresh cache** of "where are we." Four framings — store, salience picker, lossy
+linking gist, drift detector — and they all hit the same wall: **an SSM compresses, it
+does not compare.** Three failed on that; the one that worked (a Falcon-H1-3B lossy
+linking gist) wasn't worth its resident VRAM, because the store already renders the set
+*exactly and for free*, and the judgment cases the cache can't cover belong to Claude —
+already in the loop, no model to host. So the model-backed cache is **archived**: the code
+stays in the tree as the experiment, off by default and unwired from the live path. Full
+record + measured results: [`research/SSM_POSTMORTEM.md`](research/SSM_POSTMORTEM.md).
 
 ## Build status
 
+**The live product** — deterministic, GPU-free:
 - [x] **DB store** — exact truth; supersede / revert / restore validated end-to-end
-- [x] **BE index/service** — deterministic verbatim board + structured salience/driver
+- [x] **BE index/service** — deterministic verbatim board + structured driver / overlap
       (69 tests, TDD, GPU-free)
 - [x] **MCP server** — live-verified over streamable-HTTP (both CCs call it over LAN)
-- [x] **SSM streaming cache** — validated: constant-cost fold, **zero drift vs batch**,
-      live query at any mid-stream point, recency-fresh (`scripts/streaming_test2.py`)
-- [~] **SSM faithful envelope** ~25 entries / ~1k tok — bigger view ⇒ bigger-state model
-- [x] **Per-project state sharding** — one SSM state per project (`ShardedSSMEngine`,
-      keyed by `index.project_of`) complements the envelope above: it's per-STATE, so N
-      projects ≈ N× fresh headroom with no bigger model, and churn replays only its shard;
-      exposed as the `project_digests` MCP tool (per-project streaming digests)
-- [x] **Hybrid compaction gist** — Falcon-H1-3B (SSM/attention, kernel-free on Blackwell)
-      folds the BE-capped board into a lossy *linked* gist (links only stated relations),
-      wired as the `overview` MCP tool (`ctx/compaction.py`); degrades gracefully where pure
-      Mamba collapses past its envelope — lossy + non-authoritative, the DB stays exact
-- [x] **SSM selection/judgment** — tested and **rejected**: judging salience is not the
-      SSM's job (`scripts/salience_select.py`, 0/3 — it copies input order, ignores intent)
-- [x] **Fold prompt corrected** — the summarizer no longer asks the SSM to flag overlap
-      or keep every fact (judgment + fights its recency bias); it leans into recency
-      (`ctx/prompts.py`, torch-free + test-guarded)
 - [ ] **Claude judgment integration** (dedup / conflict) — elsewhere, on demand
+
+**Explored and archived** — the model-backed cache
+([`research/SSM_POSTMORTEM.md`](research/SSM_POSTMORTEM.md)):
+- SSM streaming cache + per-project sharding (`ShardedSSMEngine`) — validated mechanics
+  (constant-cost fold, zero drift), archived: a lossy view of a set the BE renders exactly
+- Hybrid compaction gist (Falcon-H1-3B, `ctx/compaction.py`) — works, but a bad
+  resident-VRAM trade at this scale
+- SSM as store / salience / drift — **rejected**: *it compresses, it does not compare*
+  (`scripts/salience_select.py` 0/3; `scripts/drift_probe.py` — drift is a reasoning task)
 
 ## Run it (real deployment)
 
@@ -120,9 +110,9 @@ PYTHONPATH=. CTX_DB=D:/ctx/team.db CTX_PORT=8765 <env>/python.exe -m ctx.mcp_ser
 `CTX_DB` is the file that IS your team's memory — back it up, don't delete it.
 Find the machine's LAN IP (`ipconfig` / `ip addr`); both boxes point at it.
 
-The optional GPU-backed reads are off by default (the server runs GPU-free): set
-`CTX_GIST=1` for the `overview` gist or `CTX_SSM=1` for `project_digests` — on a 16 GB
-box they compete for VRAM (falcon-mamba-7b ~14 GB + Falcon-H1-3B ~6 GB), so enable one.
+The `overview` / `project_digests` MCP tools are **archived experiments**, off by default —
+the server runs fully deterministic and GPU-free. Read `research/SSM_POSTMORTEM.md` before
+enabling them (`CTX_GIST=1` / `CTX_SSM=1`); at this scale they aren't worth the VRAM.
 
 **2. On each box — add the server to Claude Code:**
 
@@ -150,6 +140,6 @@ Both CCs now share one clean, retractable "where are we."
 PYTHONPATH=. python -m pytest tests/ -q     # deterministic core (stdlib only, no GPU)
 ```
 
-Model/GPU work uses conda env with torch cu128 (RTX 5070 Ti / Blackwell); scripts in
-`scripts/` load falcon-mamba-7b and need `PYTHONPATH=.`.
+The model/GPU scripts in `scripts/` (falcon-mamba-7b, Falcon-H1-3B) are the **archived SSM
+experiments** — see `research/SSM_POSTMORTEM.md`. The live product needs none of them.
 ```

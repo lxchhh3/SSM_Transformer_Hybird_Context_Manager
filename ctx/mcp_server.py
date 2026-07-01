@@ -27,6 +27,38 @@ svc = ContextService(DB_PATH)
 mcp = FastMCP("context-manager", host=HOST, port=PORT,
               stateless_http=True, json_response=True)
 
+# Optional GPU-backed reads. Off by default so the server runs GPU-free; enable on
+# the dev machine (which has the GPU) with CTX_GIST=1 / CTX_SSM=1. They COMPETE for
+# VRAM on a 16 GB box (falcon-mamba-7b ~14 GB + Falcon-H1-3B ~6 GB) — enable one.
+GIST_ENABLED = bool(os.environ.get("CTX_GIST"))
+SSM_ENABLED = bool(os.environ.get("CTX_SSM"))
+_compactor = None
+_engine = None
+
+
+def _get_compactor():
+    global _compactor
+    if _compactor is None:
+        import torch
+        from ctx.compaction import HybridCompactor
+        _compactor = HybridCompactor(
+            os.environ.get("CTX_GIST_MODEL", "tiiuae/Falcon-H1-3B-Instruct"),
+            device="cuda", dtype=torch.float16)
+    return _compactor
+
+
+def _get_engine():
+    global _engine
+    if _engine is None:
+        import torch
+        from ctx.mamba_summarizer import MambaSummarizer
+        from ctx.ssm_engine import ShardedSSMEngine
+        summ = MambaSummarizer(
+            os.environ.get("CTX_SSM_MODEL", "tiiuae/falcon-mamba-7b-instruct"),
+            device="cuda", dtype=torch.float16)
+        _engine = ShardedSSMEngine(svc.store, summ)
+    return _engine
+
 
 @mcp.tool()
 def publish(author: str, etype: str, body: str,
@@ -90,6 +122,35 @@ def check_overlap(refs: list[str], author: Optional[str] = None) -> list:
 def recent(since_seq: int = 0) -> list:
     """Event stream since a sequence number — poll for the other dev's activity."""
     return svc.recent(since_seq=since_seq)
+
+
+@mcp.tool()
+def overview() -> dict:
+    """WHERE ARE WE as a short, readable GIST that ties related work together — a
+    lossy human-glance summary over the capped board. Non-authoritative (it may
+    compress or omit): drill into `status_board` for the exact set. Falls back to
+    the verbatim board when the gist model is disabled (enable with CTX_GIST=1 on
+    the dev machine). Returns {overview, shown, overflow, selector}."""
+    if not GIST_ENABLED:
+        return svc.overview()  # deterministic verbatim board — always works
+    try:
+        return svc.overview(compactor=_get_compactor())
+    except Exception as e:  # never take the server down for a model hiccup
+        res = svc.overview()
+        res["gist_error"] = f"{type(e).__name__}: {e}"
+        return res
+
+
+@mcp.tool()
+def project_digests() -> dict:
+    """Per-project streaming SSM digests — a constant-cost 'where are we' per
+    project, each stream kept in its own faithful envelope. Requires CTX_SSM=1 on
+    the dev machine (loads a Mamba on the GPU); otherwise returns a disabled note.
+    Returns {digests: {project: text}, projects: [...]}"""
+    if not SSM_ENABLED:
+        return {"enabled": False,
+                "note": "SSM disabled; set CTX_SSM=1 on the dev machine (GPU)."}
+    return svc.project_digests(_get_engine())
 
 
 if __name__ == "__main__":

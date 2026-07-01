@@ -121,5 +121,39 @@ class ContextService:
             "selector": "recency",
         }
 
+    def overview(self, compactor: Optional[Any] = None,
+                 cap_entries: int = CAP_ENTRIES,
+                 cap_tokens: Optional[int] = None,
+                 measure: Optional[Any] = None) -> dict[str, Any]:
+        """Lossy linked 'where are we' gist over the CAPPED working set.
+
+        `compactor` is a HybridCompactor (or any object with `.compact(entries)`);
+        without one this falls back to the deterministic verbatim board, so the
+        read always works GPU-free. Capping first keeps the compactor's input
+        bounded (so a hybrid's KV stays bounded — memory hybrid-compaction-gist),
+        and the overflow is surfaced, never hidden: those entries stay in the store
+        for exact recall."""
+        active = self.store.active_entries()
+        ws = working_set(active, cap_entries=cap_entries, cap_tokens=cap_tokens,
+                         measure=measure)
+        kept = ws["kept"]
+        if compactor is None:
+            text, selector = render_board(kept), "board"
+        else:
+            text, selector = compactor.compact(kept), "gist"
+        return {"overview": text, "shown": len(kept),
+                "overflow": len(ws["dropped"]),
+                "overflow_ids": [e["entry_id"] for e in ws["dropped"]],
+                "selector": selector}
+
+    def project_digests(self, engine: Any) -> dict[str, Any]:
+        """Per-project streaming SSM digests. `engine` is a ShardedSSMEngine; this
+        syncs it against the store, then reads each non-empty shard — each stream
+        kept in its own faithful envelope (report finding 5)."""
+        engine.sync()
+        projects = engine.projects()
+        return {"digests": {p: engine.digest(p) for p in projects},
+                "projects": projects}
+
     def recent(self, since_seq: int = 0) -> list[dict[str, Any]]:
         return self.store.events_since(since_seq)

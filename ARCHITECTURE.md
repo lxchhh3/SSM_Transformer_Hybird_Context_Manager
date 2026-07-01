@@ -33,8 +33,9 @@ These are load-bearing; violating one is how the design drifts.
 1. **Truth lives in the DB, never in a model's context.**
 2. **Every input is an update.** The streaming model folds *all* updates; it never
    decides which are real, true, or important.
-3. **Exact retraction = the DB** (explicit supersede/revert). **Graceful fade of the
-   merely-old = the SSM** (recency decay). Complementary, not redundant.
+3. **Exact retraction = the DB** (explicit supersede/revert). **Lossy fade of the
+   merely-old = the cache** (recency decay in the streaming carry, compaction in the
+   gist). Complementary, not redundant.
 4. **Judgment = Claude or a deterministic rule** (dedup, conflict, merge, salience).
    **Never the SSM** — comparison is its architectural weakness (see §6).
 5. **The cache is derived and lossy; the DB is exact.** "Dropped" never means "lost":
@@ -50,8 +51,8 @@ These are load-bearing; violating one is how the design drifts.
             └──────┬──────┘
              DEV MACHINE
   ┌───────────────────────────────────────────────────────────┐
-  │ FE     display: exact board  |  or SSM gist                 │  what a consumer reads
-  │ CACHE  SSM — constant-size, always-fresh "where are we"      │  O(1) in AND out
+  │ FE     display: exact board  |  or the gist                 │  what a consumer reads
+  │ CACHE  lossy linking gist + O(1) streaming carry (dual)      │  derived, lossy, optional
   │ BE     index / service — query, shape, render (deterministic)│  structured, GPU-free
   │ DB     store — source of truth; clean retraction             │  append log + active state
   └───────────────────────────────────────────────────────────┘
@@ -62,7 +63,7 @@ These are load-bearing; violating one is how the design drifts.
 |-------|--------|-----|--------------|
 | DB    | `ctx/store.py` | source of truth | exact, append-only + retractable |
 | BE    | `ctx/index.py`, `ctx/service.py` | query/shape/render | deterministic, GPU-free |
-| cache | `ctx/mamba_summarizer.py`, `ctx/ssm_engine.py`, `ctx/compaction.py` | streaming fold (Mamba) + lossy linking gist (hybrid) | O(1) fold; bounded compaction pass |
+| cache | `ctx/compaction.py`, `ctx/ssm_engine.py`, `ctx/mamba_summarizer.py` | lossy linking gist (hybrid) + O(1) streaming carry (Mamba) | derived, lossy, optional |
 | FE    | the board string / a CC / a human | display | exact *or* glanceable |
 | judge | Claude (in the CC sessions) | dedup / conflict / merge | on demand, not hosted here |
 
@@ -102,20 +103,55 @@ fact vanishes on revert; a supersede→revert flips the board back to the origin
 
 ---
 
-## 6. The SSM cache — pro, mechanism, and honest limits
+## 6. The model-backed cache — two roles over the exact core
 
-**Why an SSM at all.** It ingests an unbounded, high-frequency stream at **constant
-memory and constant cost**, and the fixed state it keeps *is already* the compressed,
-current "where are we." The DB appends O(1) too, but its readout is O(N active); the
-SSM is **O(1) in and out**, and **recency-fresh for free** (old fades as new folds in —
-anti-poisoning by decay, no judgment). That constant-size readout of an endless stream
-is the differentiated value. Full cited record: `research/deep_research_report.md`.
+The DB + BE already deliver the live product *deterministically and GPU-free*: the
+verbatim board needs no model. Everything here is an **optional readout layer on top**
+of that exact core — derived, lossy, never the truth (Principle 5), with the DB always
+the fallback for exact. And it is **not one model doing one thing**: a hybrid probe this
+cycle (`scripts/hybrid_stage2.py`) split it into two roles with different mechanics,
+footprints, and jobs — the readable *gist* most consumers actually reach for, and the
+constant-cost *streaming carry* for an unbounded firehose. Cited record:
+`research/deep_research_report.md`.
 
-**Mechanism.** Each event is folded once into the recurrent state (`cache_params` =
-conv + recurrent states). Exact revert re-syncs by replaying the affected tail from the
-nearest checkpoint (`ctx/ssm_engine.py`), never by asking the model to un-remember.
+### 6a. The lossy compaction gist — the readable "where are we" (`Falcon-H1-3B` → `overview`)
 
-**What we measured** (falcon-mamba-7b-instruct, fp16, on an RTX 5070 Ti):
+What a consumer (a human, or another CC) usually wants: not a verbatim relist but a
+short, **linked** overview that ties related work together. `HybridCompactor`
+(`ctx/compaction.py`) feeds the BE's *capped* verbatim board into a small SSM/attention
+**hybrid** and compacts it into that gist.
+
+- **Lossy is the point, not a defect.** It paraphrases, groups, and drops detail *by
+  design* — exact recall is the DB's job (Principle 5). Its job is to *link* facts into a
+  glanceable picture; judging it on verbatim recall grades it against the wrong job.
+- **It links only what the board states.** A linking probe (`scripts/hybrid_stage3_link.py`)
+  showed that *inviting* it to hunt dependencies makes it hallucinate false ones, so the
+  prompt forbids speculation — it connects an explicit reference (one entry reads
+  another's output), never an inferred one. LINK ≠ JUDGE (Principle 4): it synthesizes
+  what it is *given*; truth, salience, and conflict stay the DB's and Claude's.
+- **It degrades gracefully.** Where a pure Mamba *collapses* past its envelope into
+  garbage, the hybrid keeps emitting a coherent, format-clean board — its attention holds
+  a near-verbatim view of the (bounded) input instead of compressing into a saturating
+  fixed state. Cost: a **growing** KV cache (94→156 MB in the sweep), bounded only
+  *because the input is the BE-capped set* — that cap is exactly what makes a hybrid safe
+  here. Evidence: `scripts/hybrid_stage2.py`, `scripts/hybrid_stage3_link.py`.
+
+### 6b. The constant-size streaming carry — the O(1) firehose primitive (pure Mamba → `project_digests`)
+
+The original SSM value, and still the only thing that does it: fold an **unbounded,
+high-frequency** stream at **constant memory and constant cost**, where the fixed state
+it keeps *is already* the current "where are we." The DB appends O(1) too, but its
+readout is O(N active); a pure Mamba is **O(1) in and out**, recency-fresh for free (old
+fades as new folds in — anti-poisoning by decay, no judgment).
+
+- **Mechanism.** Each event folds once into the recurrent state (`cache_params` = conv +
+  recurrent states); an exact revert re-syncs by replaying the affected tail from the
+  nearest checkpoint (`ctx/ssm_engine.py`), never by asking the model to un-remember.
+- **Sharding is the envelope lever.** `ShardedSSMEngine` keeps one fold state *per
+  project* (report finding 5: recall scales with state-per-stream), so each stream stays
+  under the faithful envelope and a hot-project revert replays only *that* shard — the
+  first lever to reach for, before a bigger-state model.
+- **Measured** (falcon-mamba-7b-instruct, fp16, RTX 5070 Ti):
 
 | Finding | Result | Evidence |
 |---------|--------|----------|
@@ -125,39 +161,25 @@ nearest checkpoint (`ctx/ssm_engine.py`), never by asking the model to un-rememb
 | Recency bias | old facts fade first as the state saturates | knee sweep |
 | **Selection/judgment** | **rejected — 0/3**: asked to pick load-bearing entries it just copies input order, ignoring intent | `scripts/salience_select.py` |
 
-**The limits define the boundaries with the other layers** (see also the deep-research
-report's confirmed limits): no random access → exact recall is the DB's job;
-capacity-bounded to ~25 entries → the DB is the archive, the SSM the recent view;
-**cannot judge** → salience/dedup/conflict is Claude's or a deterministic rule's job.
+- **Honest limit.** Past ~25 entries / ~1k tokens the fixed state saturates and
+  **collapses** (2600 tok → runaway `[x]` garbage in the sweep) — exactly why capping +
+  sharding matter here, and why the gist (6a), which never collapses, is the better fit
+  for a *readable* overview. The one lever for a bigger faithful envelope is a **bigger
+  state** (larger-`d_state` SSM); 6a sidesteps the wall by not compressing into a fixed
+  state at all.
 
-**Per-project sharding — the cheap envelope lever.** The faithful envelope is a property
-of *one* state, not the whole team (deep-research report finding 5: recall capacity
-scales with state-per-stream). `ShardedSSMEngine` (`ctx/ssm_engine.py`) keeps one fold
-state *per project* (keyed by the BE's `project_of`), so each stream stays under the
-~25-entry envelope and a busy team turns one global wall into many rarely-hit ones.
-Structural bonus: shards are independent, so churn in a hot project replays only *that*
-shard — a revert never re-folds a cold project. This is the first envelope lever to
-reach for, before a bigger-state model.
+### Shared boundaries (both roles)
 
-**Two cache roles (not one model).** A hybrid probe (`scripts/hybrid_stage2.py`,
-falcon-mamba-7b vs `Falcon-H1-3B`) split this layer in two:
+Both inherit the same limits (deep-research report, confirmed): no random access → exact
+recall is the DB's; capacity-bounded → the DB is the archive; **cannot judge** →
+salience/dedup/conflict is Claude's or a deterministic rule's (Principle 4; the rejected
+`salience_select.py`, 0/3). Neither role is ever the source of truth — the gist and the
+streaming state are both derived views the DB can always reconstruct.
 
-- **(i) Streaming carry** over an *unbounded* firehose → **pure Mamba**. Flat ~21 MB
-  state, no growing KV; collapses past its envelope, so it wants sharding/capping.
-- **(ii) Lossy compaction gist** over the *BE-capped* working set → **`Falcon-H1-3B`**
-  (`ctx/compaction.py`, `HybridCompactor`). It compacts + *links* the board into a
-  readable "where are we" and **never collapses**; its attention KV grows (94→156 MB in
-  the sweep) but stays bounded because the input is the capped set. The gist links only
-  what the board *explicitly states* — a linking probe (`scripts/hybrid_stage3_link.py`)
-  showed that inviting it to *hunt* dependencies makes it hallucinate false ones, so the
-  prompt forbids speculation. The gist is the **lossy, non-authoritative** top layer;
-  exact recall stays the DB's, and it never judges truth/salience (Principle 4).
-
-**Current status of this layer.** The DB + BE still deliver the deterministic live
-product (verbatim board, no model in the path). Both model roles are now **wired but
-optional**: MCP `project_digests` (sharded streaming digests, `CTX_SSM=1`) and
-`overview` (the lossy gist, `CTX_GIST=1`), each lazy-loaded on the dev-machine GPU with
-a deterministic board fallback. They compete for VRAM on a 16 GB box — enable one.
+**Status.** The DB + BE are the deterministic product today. Both model roles are **wired
+but optional**: MCP `overview` (the gist, `CTX_GIST=1`) and `project_digests` (sharded
+streaming, `CTX_SSM=1`), each lazy-loaded on the dev-machine GPU with a deterministic
+board fallback — they compete for VRAM on a 16 GB box, so enable one.
 
 ---
 

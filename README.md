@@ -87,13 +87,24 @@ the constant-size SSM cache earns its seat, and wants a bigger state to stay fai
 
 - [x] **DB store** — exact truth; supersede / revert / restore validated end-to-end
 - [x] **BE index/service** — deterministic verbatim board + structured salience/driver
-      (48 tests, TDD, GPU-free)
+      (69 tests, TDD, GPU-free)
 - [x] **MCP server** — live-verified over streamable-HTTP (both CCs call it over LAN)
 - [x] **SSM streaming cache** — validated: constant-cost fold, **zero drift vs batch**,
       live query at any mid-stream point, recency-fresh (`scripts/streaming_test2.py`)
 - [~] **SSM faithful envelope** ~25 entries / ~1k tok — bigger view ⇒ bigger-state model
+- [x] **Per-project state sharding** — one SSM state per project (`ShardedSSMEngine`,
+      keyed by `index.project_of`) complements the envelope above: it's per-STATE, so N
+      projects ≈ N× fresh headroom with no bigger model, and churn replays only its shard;
+      exposed as the `project_digests` MCP tool (per-project streaming digests)
+- [x] **Hybrid compaction gist** — Falcon-H1-3B (SSM/attention, kernel-free on Blackwell)
+      folds the BE-capped board into a lossy *linked* gist (links only stated relations),
+      wired as the `overview` MCP tool (`ctx/compaction.py`); degrades gracefully where pure
+      Mamba collapses past its envelope — lossy + non-authoritative, the DB stays exact
 - [x] **SSM selection/judgment** — tested and **rejected**: judging salience is not the
       SSM's job (`scripts/salience_select.py`, 0/3 — it copies input order, ignores intent)
+- [x] **Fold prompt corrected** — the summarizer no longer asks the SSM to flag overlap
+      or keep every fact (judgment + fights its recency bias); it leans into recency
+      (`ctx/prompts.py`, torch-free + test-guarded)
 - [ ] **Claude judgment integration** (dedup / conflict) — elsewhere, on demand
 
 ## Run it (real deployment)
@@ -108,6 +119,10 @@ PYTHONPATH=. CTX_DB=D:/ctx/team.db CTX_PORT=8765 <env>/python.exe -m ctx.mcp_ser
 
 `CTX_DB` is the file that IS your team's memory — back it up, don't delete it.
 Find the machine's LAN IP (`ipconfig` / `ip addr`); both boxes point at it.
+
+The optional GPU-backed reads are off by default (the server runs GPU-free): set
+`CTX_GIST=1` for the `overview` gist or `CTX_SSM=1` for `project_digests` — on a 16 GB
+box they compete for VRAM (falcon-mamba-7b ~14 GB + Falcon-H1-3B ~6 GB), so enable one.
 
 **2. On each box — add the server to Claude Code:**
 

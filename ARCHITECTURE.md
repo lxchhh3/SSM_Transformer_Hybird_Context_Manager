@@ -2,8 +2,8 @@
 
 How Context_Manager is built and *why* it's shaped this way. The README is the
 one-screen north star; this is the design rationale, including the empirical results
-that pushed each decision. For the SSM strength/limit menu see
-[`research/advantage_surface.md`](research/advantage_surface.md).
+that pushed each decision. For the cited SSM/hybrid research record see
+[`research/deep_research_report.md`](research/deep_research_report.md).
 
 ---
 
@@ -62,7 +62,7 @@ These are load-bearing; violating one is how the design drifts.
 |-------|--------|-----|--------------|
 | DB    | `ctx/store.py` | source of truth | exact, append-only + retractable |
 | BE    | `ctx/index.py`, `ctx/service.py` | query/shape/render | deterministic, GPU-free |
-| cache | `ctx/mamba_summarizer.py`, `ctx/ssm_engine.py` | streaming compressed view | O(1) fold, constant-size readout |
+| cache | `ctx/mamba_summarizer.py`, `ctx/ssm_engine.py`, `ctx/compaction.py` | streaming fold (Mamba) + lossy linking gist (hybrid) | O(1) fold; bounded compaction pass |
 | FE    | the board string / a CC / a human | display | exact *or* glanceable |
 | judge | Claude (in the CC sessions) | dedup / conflict / merge | on demand, not hosted here |
 
@@ -109,7 +109,7 @@ memory and constant cost**, and the fixed state it keeps *is already* the compre
 current "where are we." The DB appends O(1) too, but its readout is O(N active); the
 SSM is **O(1) in and out**, and **recency-fresh for free** (old fades as new folds in —
 anti-poisoning by decay, no judgment). That constant-size readout of an endless stream
-is the differentiated value. Full strength/limit menu: `research/advantage_surface.md`.
+is the differentiated value. Full cited record: `research/deep_research_report.md`.
 
 **Mechanism.** Each event is folded once into the recurrent state (`cache_params` =
 conv + recurrent states). Exact revert re-syncs by replaying the affected tail from the
@@ -125,17 +125,39 @@ nearest checkpoint (`ctx/ssm_engine.py`), never by asking the model to un-rememb
 | Recency bias | old facts fade first as the state saturates | knee sweep |
 | **Selection/judgment** | **rejected — 0/3**: asked to pick load-bearing entries it just copies input order, ignoring intent | `scripts/salience_select.py` |
 
-**The limits define the boundaries with the other layers** (see also
-`advantage_surface.md` §Limits): no random access → exact recall is the DB's job;
+**The limits define the boundaries with the other layers** (see also the deep-research
+report's confirmed limits): no random access → exact recall is the DB's job;
 capacity-bounded to ~25 entries → the DB is the archive, the SSM the recent view;
 **cannot judge** → salience/dedup/conflict is Claude's or a deterministic rule's job.
 
-**Current status of this layer.** The DB + BE deliver the live product today (the board
-is fully deterministic — no model in the path). The SSM cache is **validated in
-principle** (the table above) but **not yet wired into the live readout**; it's the
-*scale-insurance* layer, to switch on when the active set outgrows cheap verbatim
-feeding — and at that scale it wants a **bigger state** (a larger-`d_state` SSM), the
-one honest lever for a bigger faithful envelope.
+**Per-project sharding — the cheap envelope lever.** The faithful envelope is a property
+of *one* state, not the whole team (deep-research report finding 5: recall capacity
+scales with state-per-stream). `ShardedSSMEngine` (`ctx/ssm_engine.py`) keeps one fold
+state *per project* (keyed by the BE's `project_of`), so each stream stays under the
+~25-entry envelope and a busy team turns one global wall into many rarely-hit ones.
+Structural bonus: shards are independent, so churn in a hot project replays only *that*
+shard — a revert never re-folds a cold project. This is the first envelope lever to
+reach for, before a bigger-state model.
+
+**Two cache roles (not one model).** A hybrid probe (`scripts/hybrid_stage2.py`,
+falcon-mamba-7b vs `Falcon-H1-3B`) split this layer in two:
+
+- **(i) Streaming carry** over an *unbounded* firehose → **pure Mamba**. Flat ~21 MB
+  state, no growing KV; collapses past its envelope, so it wants sharding/capping.
+- **(ii) Lossy compaction gist** over the *BE-capped* working set → **`Falcon-H1-3B`**
+  (`ctx/compaction.py`, `HybridCompactor`). It compacts + *links* the board into a
+  readable "where are we" and **never collapses**; its attention KV grows (94→156 MB in
+  the sweep) but stays bounded because the input is the capped set. The gist links only
+  what the board *explicitly states* — a linking probe (`scripts/hybrid_stage3_link.py`)
+  showed that inviting it to *hunt* dependencies makes it hallucinate false ones, so the
+  prompt forbids speculation. The gist is the **lossy, non-authoritative** top layer;
+  exact recall stays the DB's, and it never judges truth/salience (Principle 4).
+
+**Current status of this layer.** The DB + BE still deliver the deterministic live
+product (verbatim board, no model in the path). Both model roles are now **wired but
+optional**: MCP `project_digests` (sharded streaming digests, `CTX_SSM=1`) and
+`overview` (the lossy gist, `CTX_GIST=1`), each lazy-loaded on the dev-machine GPU with
+a deterministic board fallback. They compete for VRAM on a 16 GB box — enable one.
 
 ---
 
@@ -162,8 +184,12 @@ All deterministic and GPU-free (`ctx/service.py`, `ctx/index.py`):
 ## 8. Interface & topology (the MCP server)
 
 `ctx/mcp_server.py` is a thin FastMCP HTTP adapter over `ContextService`, stateless
-(`stateless_http=True`) because all state lives in the DB. Tools: `publish`,
-`status_board`, `check_overlap`, `supersede`, `revert`, `team_state`, `recent`.
+(`stateless_http=True`) because all state lives in the DB. Deterministic tools:
+`publish`, `status_board`, `check_overlap`, `supersede`, `revert`, `team_state`,
+`recent`. Optional GPU-backed reads (off by default; enable on the dev machine):
+`overview` (the lossy linking gist, `CTX_GIST=1`) and `project_digests` (per-project
+streaming digests, `CTX_SSM=1`) — each lazy-loads its model and falls back to the
+verbatim board, and the two compete for VRAM on a 16 GB box.
 
 ```
   kevin's box (CC)  ──http──┐
@@ -182,21 +208,31 @@ The working loop, per box (set in each box's `CLAUDE.md`): **read the board →
 - **DB** — exact retraction incl. supersede→revert→restore (`tests/test_store.py`,
   `scripts/revert_stream_test.py`).
 - **BE** — verbatim board, driver/attribution, envelope + surfaced overflow, file-ref
-  overlap (`tests/test_index.py`, `tests/test_service.py`). 48 tests green, GPU-free.
-- **MCP** — all 7 tools live over streamable-HTTP, overlap warning + board over the
-  wire (`scripts/verify_mcp.py`).
+  overlap (`tests/test_index.py`, `tests/test_service.py`). **69 tests green, GPU-free**
+  (incl. prompt-invariant, sharding, compaction, and wiring guards).
+- **MCP** — the deterministic tools live over streamable-HTTP, overlap warning + board
+  over the wire (`scripts/verify_mcp.py`); the optional `overview`/`project_digests`
+  reads are wired with a deterministic fallback.
 - **SSM cache** — fixed state, faithful envelope, zero-drift streaming, revert re-sync
-  (scripts in §6); **selection explicitly disproven**.
+  (scripts in §6); **per-project sharding** (`ShardedSSMEngine`); **selection explicitly
+  disproven**.
+- **Hybrid compaction gist** — `Falcon-H1-3B` runs kernel-free on Blackwell, compacts +
+  links the capped board without collapsing, links only stated relations (no
+  speculation); verified end-to-end (`scripts/hybrid_stage2.py`,
+  `scripts/hybrid_stage3_link.py`, `scripts/compact_demo.py`).
 
 ---
 
 ## 10. Open questions (candidates, not commitments)
 
-From `research/advantage_surface.md` — pick *from* these, don't do all of them:
+From `research/deep_research_report.md` — pick *from* these, don't do all of them:
 
-- **Shard SSM state by project** so each stream stays under the ~25-entry envelope.
-- **Bigger state, not bigger model** (Mamba-2 `d_state`, RWKV-7) as the envelope lever.
+- ~~**Shard SSM state by project**~~ — **done** (`ShardedSSMEngine`, §6).
+- **Bigger state, not bigger model** (Mamba-2 `d_state`, RWKV-7) as the envelope lever —
+  still the honest lever for role (i); the hybrid gist is the answer for role (ii).
+- **Same-size hybrid vs pure test** (e.g. mamba-2.8b vs a 2.8B hybrid) to cleanly settle
+  the report's mechanism claim — the shipped 3B-hybrid-vs-7B-Mamba comparison confounds
+  size (it answered the *swap* decision, not the mechanism).
 - **Δ carries real elapsed time** so recency-fade tracks wall-clock, not event count.
-- **Input-shaping before folding** to fit more entries per 1k-token budget.
 - **Wire the Claude judgment tier** (dedup / conflict escalation) — the last core gap.
 ```

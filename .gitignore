@@ -11,3 +11,4 @@ team.db
 .venv/
 models/
 *.log
+lesson.md

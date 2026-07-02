@@ -153,9 +153,14 @@ def project_digests() -> dict:
     return svc.project_digests(_get_engine())
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console entry point (`ctx-mcp-server`) — also `python -m ctx.mcp_server`."""
     print(f"[context-manager] serving on http://{HOST}:{PORT}/mcp", flush=True)
     print(f"[context-manager] source of truth: {os.path.abspath(DB_PATH)}", flush=True)
     print("[context-manager] add on each box: claude mcp add --transport http "
           f"context-manager http://<dev-machine-ip>:{PORT}/mcp", flush=True)
     mcp.run(transport="streamable-http")
+
+
+if __name__ == "__main__":
+    main()

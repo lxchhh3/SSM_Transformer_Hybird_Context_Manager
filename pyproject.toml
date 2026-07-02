@@ -1,8 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ctx-manager"
-version = "0.0.1"
-description = "Shared context layer for parallel CC-driven dev (store + MCP + Mamba SSM view)"
+version = "0.1.0"
+description = "Shared context layer for parallel CC-driven dev — SQLite source of truth + deterministic verbatim board, served over MCP (DB + BE + Claude, GPU-free)"
 requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.8",
+]
+
+[project.optional-dependencies]
+# Archived model-backed cache experiments (research/SSM_POSTMORTEM.md) — NOT the
+# product. Only needed to re-run the record with CTX_GIST=1 / CTX_SSM=1.
+ssm = ["torch>=2.4", "transformers>=4.45"]
+
+[project.scripts]
+ctx-mcp-server = "ctx.mcp_server:main"
+
+[tool.setuptools.packages.find]
+include = ["ctx"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

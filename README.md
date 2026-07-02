@@ -86,6 +86,8 @@ record + measured results: [`research/SSM_POSTMORTEM.md`](research/SSM_POSTMORTE
 - [x] **BE index/service** — deterministic verbatim board + structured driver / overlap
       (69 tests, TDD, GPU-free)
 - [x] **MCP server** — live-verified over streamable-HTTP (both CCs call it over LAN)
+- [x] **Packaged** — pip-installable wheel (`ctx` package only), `ctx-mcp-server`
+      entry point; installed package E2E-verified over a real MCP client
 - [ ] **Claude judgment integration** (dedup / conflict) — elsewhere, on demand
 
 **Explored and archived** — the model-backed cache
@@ -99,12 +101,20 @@ record + measured results: [`research/SSM_POSTMORTEM.md`](research/SSM_POSTMORTE
 
 ## Run it (real deployment)
 
-**1. On the dev machine — start the shared brain** (any env with `mcp`; call the env
-python directly, `conda run` buffers):
+**1. On the dev machine — start the shared brain.** Install the package (Python ≥3.11;
+pulls only `mcp`), then run the console command:
+
+```bash
+<env>/python.exe -m pip install .        # from the repo root (or the wheel in dist/)
+CTX_DB=D:/ctx/team.db CTX_PORT=8765 ctx-mcp-server
+# prints the URL + the absolute DB path it's serving
+```
+
+Or straight from the repo without installing (call the env python directly,
+`conda run` buffers):
 
 ```bash
 PYTHONPATH=. CTX_DB=D:/ctx/team.db CTX_PORT=8765 <env>/python.exe -m ctx.mcp_server
-# prints the URL + the absolute DB path it's serving
 ```
 
 `CTX_DB` is the file that IS your team's memory — back it up, don't delete it.

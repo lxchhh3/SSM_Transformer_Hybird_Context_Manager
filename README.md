@@ -153,6 +153,9 @@ claude mcp add --transport http context-manager http://<dev-machine-ip>:8765/mcp
 }
 ```
 
+Use FORWARD slashes in the command path — on Windows, CC runs hook commands through
+Git Bash, which eats backslashes (`D:\...` becomes "command not found").
+
 SessionStart injects the verbatim board; UserPromptSubmit injects only NEW teammate
 events since that session last looked (per-session seq watermark) — a live stream, not
 a snapshot, with zero prompt-compliance gamble. The hooks read the DB directly (ms-fast,

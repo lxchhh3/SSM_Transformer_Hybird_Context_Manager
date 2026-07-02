@@ -117,6 +117,17 @@ Or straight from the repo without installing (call the env python directly,
 PYTHONPATH=. CTX_DB=D:/ctx/team.db CTX_PORT=8765 <env>/python.exe -m ctx.mcp_server
 ```
 
+To make it boot-persistent on Windows, run the service setup once (elevated):
+
+```powershell
+sudo powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup_service.ps1
+```
+
+It registers a `context-manager-mcp` Scheduled Task — AtStartup, SYSTEM, restart-on-
+failure, no time limit, log-rotating launcher in `D:\ctx` — and opens inbound TCP 8765
+(Domain/Private profiles) so the other box can reach it. Idempotent; parameters
+(`-DbPath`, `-Port`, `-ServerExe`, `-NoFirewall`) override the defaults.
+
 `CTX_DB` is the file that IS your team's memory — back it up, don't delete it.
 Find the machine's LAN IP (`ipconfig` / `ip addr`); both boxes point at it.
 

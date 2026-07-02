@@ -34,9 +34,10 @@ def test_declares_mcp_runtime_dependency(pyproject):
         "the live product is the MCP server; `mcp` must be a runtime dep")
 
 
-def test_console_entry_point_declared(pyproject):
+def test_console_entry_points_declared(pyproject):
     scripts = pyproject["project"].get("scripts", {})
     assert scripts.get("ctx-mcp-server") == "ctx.mcp_server:main"
+    assert scripts.get("ctx-cc-hook") == "ctx.hooks:main"
 
 
 def test_wheel_ships_only_ctx_package(pyproject):

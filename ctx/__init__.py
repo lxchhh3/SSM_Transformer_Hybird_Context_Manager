@@ -5,6 +5,8 @@ The live product (see README) is deterministic and GPU-free:
   index      = BE: deterministic grouping/driver/cap over the store
   service    = BE: the query surface the tools call
   mcp_server = both CC sessions call these tools over the LAN
+  hooks      = read-side CC harness hooks: board at SessionStart, new-event
+               stream at UserPromptSubmit (deterministic injection)
 
 Judgment (dedup / conflict / merge) = Claude, on demand, elsewhere.
 
@@ -13,4 +15,4 @@ ARCHIVED model-backed cache experiments — kept as the record, off by default
 (research/SSM_POSTMORTEM.md). Nothing in the live path imports them.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -88,6 +88,8 @@ record + measured results: [`research/SSM_POSTMORTEM.md`](research/SSM_POSTMORTE
 - [x] **MCP server** — live-verified over streamable-HTTP (both CCs call it over LAN)
 - [x] **Packaged** — pip-installable wheel (`ctx` package only), `ctx-mcp-server`
       entry point; installed package E2E-verified over a real MCP client
+- [x] **CC hooks** (`ctx-cc-hook`) — deterministic read-side injection: verbatim board
+      at SessionStart, per-session new-event stream at UserPromptSubmit
 - [ ] **Claude judgment integration** (dedup / conflict) — elsewhere, on demand
 
 **Explored and archived** — the model-backed cache
@@ -141,19 +143,37 @@ enabling them (`CTX_GIST=1` / `CTX_SSM=1`); at this scale they aren't worth the 
 claude mcp add --transport http context-manager http://<dev-machine-ip>:8765/mcp
 ```
 
-**3. On each box — set identity + habit** in that box's `CLAUDE.md` (so the CC passes
-the right author and actually uses it):
+**3. On each box — make the reads deterministic** with the CC hooks the wheel installs
+(`ctx-cc-hook`). Add to that box's `~/.claude/settings.json` (all projects):
+
+```json
+"hooks": {
+  "SessionStart":     [{"hooks": [{"type": "command", "command": "<env>/Scripts/ctx-cc-hook.exe session-start", "timeout": 15}]}],
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "<env>/Scripts/ctx-cc-hook.exe prompt-submit", "timeout": 10}]}]
+}
+```
+
+SessionStart injects the verbatim board; UserPromptSubmit injects only NEW teammate
+events since that session last looked (per-session seq watermark) — a live stream, not
+a snapshot, with zero prompt-compliance gamble. The hooks read the DB directly (ms-fast,
+works if the server is down); on a remote box set `CTX_DB` to a shared path or skip the
+hooks and rely on the MCP tools. Fail-soft: errors go to `<db dir>/hook_state/last_error.txt`.
+
+**4. On each box — set identity + write-side habit** in that box's `CLAUDE.md` (the
+judgment calls stay with the CC):
 
 ```
-You are `kevin` (boss's box: `boss`). Use the context-manager MCP server:
-- At the start of a coding session, call `status_board` to see where the team is.
-- Before starting work on files, call `check_overlap` with those files.
-- When you finish a unit of work or make a decision, `publish` it (with project + refs).
-- If you change your mind, `supersede` the old entry; if you abandon it, `revert`.
+You are `kevin` (boss's box: `boss`). Team board + new-event stream arrive via hooks
+([context-manager] blocks) — background truth, don't re-derive it. Your job is the
+write side, via the context-manager MCP tools:
+- Before your first edit to a repo's files in a session, `check_overlap` those files.
+- Finished a unit of work / made a decision → `publish` (project, refs, body ≤ 2 sentences).
+- Replacing a published decision: find its entry_id via `team_state`/`recent`, then
+  `supersede`; abandoned → `revert`.
 ```
 
-That's the whole loop: read the board → check for collisions → do work → publish it.
-Both CCs now share one clean, retractable "where are we."
+That's the whole loop — reads injected, writes judged: see the board → check collisions →
+do work → publish. Both CCs share one clean, retractable, LIVE "where are we."
 
 ## Dev
 

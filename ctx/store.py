@@ -167,6 +167,11 @@ class Store:
     def all_events(self) -> list[dict[str, Any]]:
         return self.events_since(0)
 
+    def max_seq(self) -> int:
+        """Current tip of the event log — the watermark primitive for streams."""
+        cur = self.conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events")
+        return int(cur.fetchone()[0])
+
     # -- internals -----------------------------------------------------------
 
     def _append_event(self, kind: str, entry_id: str,

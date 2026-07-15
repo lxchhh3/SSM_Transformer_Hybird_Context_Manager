@@ -86,7 +86,8 @@ def session_start(db_path: str, state_dir: str, session_id: str) -> str:
         # watermark BEFORE the board read: a write landing in between shows up
         # twice (board + stream) rather than never
         tip = svc.store.max_seq()
-        res = svc.status_board(now=datetime.now(timezone.utc), soften_caps=True)
+        res = svc.status_board(now=datetime.now(timezone.utc), soften_caps=True,
+                               pin_types=("decision",))
     finally:
         svc.close()
     _write_seq(state_dir, session_id, tip)

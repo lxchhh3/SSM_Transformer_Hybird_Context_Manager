@@ -23,6 +23,25 @@ def _preview(body: str, n: int) -> str:
     return s if len(s) <= n else s[:n - 1] + "…"
 
 
+def _split_pinned(active: list[dict[str, Any]],
+                  pin_types: tuple[str, ...]) -> tuple[list, list]:
+    """Split the active set into (pinned, rest) by entry type. Pinned entries are
+    exempt from the recency cap — a standing [decision] must never fall off the
+    board just because progress notes outpaced it."""
+    if not pin_types:
+        return [], list(active)
+    pinned = [e for e in active if e["type"] in pin_types]
+    rest = [e for e in active if e["type"] not in pin_types]
+    return pinned, rest
+
+
+def _merge_recency(pinned: list[dict[str, Any]],
+                   kept: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Weave pinned entries back into the capped set, newest-first — the same
+    display order working_set produces, so the board reads uniformly."""
+    return sorted(pinned + kept, key=lambda e: e["created_seq"], reverse=True)
+
+
 class ContextService:
     def __init__(self, db_path: str = ":memory:", store: Optional[Store] = None):
         self.store = store if store is not None else Store(db_path)
@@ -178,7 +197,8 @@ class ContextService:
                      pick: Optional[Any] = None,
                      now: Optional[datetime] = None,
                      soften_caps: bool = False,
-                     include_overflow_ids: bool = True) -> dict[str, Any]:
+                     include_overflow_ids: bool = True,
+                     pin_types: tuple[str, ...] = ()) -> dict[str, Any]:
         """The 'SSM selects, store renders' board — always VERBATIM store text.
 
         When the active set overflows the envelope AND a `pick` (SSM salience
@@ -191,31 +211,40 @@ class ContextService:
         them): add a relative-age marker and down-case shouty emphasis. Default OFF
         keeps the library call byte-verbatim. `include_overflow_ids=False` (the MCP
         edge) drops the raw id blob — the count stays, and ids are reachable via
-        team_state + get_entry."""
+        team_state + get_entry. `pin_types` (the MCP edge and hook pass
+        ("decision",), kevin's ruling) exempts those entry types from the cap
+        entirely: every active one always renders, the cap applies to the rest."""
         active = self.store.active_entries()
-        if pick is not None and len(active) > cap_entries:
-            selected = select_salient(active, pick, cap_entries=cap_entries)
+        pinned, rest = _split_pinned(active, pin_types)
+        if pick is not None and len(rest) > cap_entries:
+            selected = select_salient(rest, pick, cap_entries=cap_entries)
             sel_ids = {e["entry_id"] for e in selected}
-            dropped = [e for e in active if e["entry_id"] not in sel_ids]
+            dropped = [e for e in rest if e["entry_id"] not in sel_ids]
+            kept = _merge_recency(pinned, selected)
             res: dict[str, Any] = {
-                "board": render_board(self._attach_ts(selected), now=now,
+                "board": render_board(self._attach_ts(kept), now=now,
                                       soften_caps=soften_caps),
-                "shown": len(selected),
+                "shown": len(kept),
                 "overflow": len(dropped),
                 "selector": "ssm",
             }
+            if pin_types:
+                res["pinned"] = len(pinned)
             if include_overflow_ids:
                 res["overflow_ids"] = [e["entry_id"] for e in dropped]
             return res
-        ws = working_set(active, cap_entries=cap_entries,
+        ws = working_set(rest, cap_entries=cap_entries,
                          cap_tokens=cap_tokens, measure=measure)
+        kept = _merge_recency(pinned, ws["kept"])
         res = {
-            "board": render_board(self._attach_ts(ws["kept"]), now=now,
+            "board": render_board(self._attach_ts(kept), now=now,
                                   soften_caps=soften_caps),
-            "shown": len(ws["kept"]),
+            "shown": len(kept),
             "overflow": len(ws["dropped"]),
             "selector": "recency",
         }
+        if pin_types:
+            res["pinned"] = len(pinned)
         if include_overflow_ids:
             res["overflow_ids"] = [e["entry_id"] for e in ws["dropped"]]
         return res
@@ -226,7 +255,8 @@ class ContextService:
                  measure: Optional[Any] = None,
                  now: Optional[datetime] = None,
                  soften_caps: bool = False,
-                 include_overflow_ids: bool = True) -> dict[str, Any]:
+                 include_overflow_ids: bool = True,
+                 pin_types: tuple[str, ...] = ()) -> dict[str, Any]:
         """Lossy linked 'where are we' gist over the CAPPED working set.
 
         `compactor` is a HybridCompactor (or any object with `.compact(entries)`);
@@ -240,10 +270,13 @@ class ContextService:
         verbatim board (identical to status_board), not a lossy summary awaiting a
         model — the gist layer is archived (research/SSM_POSTMORTEM.md)."""
         active = self.store.active_entries()
-        ws = working_set(active, cap_entries=cap_entries, cap_tokens=cap_tokens,
+        pinned, rest = _split_pinned(active, pin_types)
+        ws = working_set(rest, cap_entries=cap_entries, cap_tokens=cap_tokens,
                          measure=measure)
-        kept = ws["kept"]
+        kept = _merge_recency(pinned, ws["kept"])
         res: dict[str, Any] = {"shown": len(kept), "overflow": len(ws["dropped"])}
+        if pin_types:
+            res["pinned"] = len(pinned)
         if include_overflow_ids:
             res["overflow_ids"] = [e["entry_id"] for e in ws["dropped"]]
         if compactor is None:

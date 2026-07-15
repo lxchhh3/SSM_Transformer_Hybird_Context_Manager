@@ -119,3 +119,27 @@ def test_get_entry_misses_are_friendly_not_raising(svc):
     assert "error" in svc.get_entry("ffffffffffff")   # no match
     svc.publish("kevin", "progress", "x", entry_id="abcde" + "0" * 27)
     assert "error" in svc.get_entry("abc")            # <6 chars: exact only
+
+
+# --- #5 decision pinning (kevin's ruling: pin ALL active decisions) ----------
+
+def test_status_board_pins_decisions_past_the_cap(svc):
+    svc.publish("kevin", "decision", "the locked call")
+    for i in range(CAP_ENTRIES + 5):
+        svc.publish("kevin", "progress", f"e{i}")
+    default = svc.status_board()                       # library default: recency only
+    assert "the locked call" not in default["board"]   # oldest entry falls off
+    res = svc.status_board(pin_types=("decision",))
+    assert "the locked call" in res["board"]           # pinned: always renders
+    assert res["shown"] == CAP_ENTRIES + 1             # 25 newest others + 1 pin
+    assert res["overflow"] == 5                        # only non-pinned overflow
+    assert res["pinned"] == 1
+
+
+def test_overview_pins_decisions_too(svc):
+    svc.publish("kevin", "decision", "old ruling")
+    for i in range(CAP_ENTRIES + 2):
+        svc.publish("kevin", "progress", f"e{i}")
+    res = svc.overview(pin_types=("decision",))
+    assert "old ruling" in res["overview"]
+    assert res["shown"] == CAP_ENTRIES + 1 and res["pinned"] == 1

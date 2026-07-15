@@ -87,11 +87,12 @@ def status_board() -> dict:
     time you need the clean current picture (superseded/reverted work already
     removed). Each bullet carries a relative age (e.g. '3d ago') and long ALL-CAPS
     emphasis is softened for skimmability — facts (numbers/names/acronyms) are
-    unchanged. Returns {board, shown, overflow}; `overflow` is a COUNT — reach
-    the older entries via team_state (ids + previews) then get_entry(id).
-    This is the primary read."""
+    unchanged. Every active [decision] is PINNED (never falls off the recency
+    cap); the 25-entry window applies to the rest. Returns {board, shown,
+    pinned, overflow}; `overflow` is a COUNT — reach the older entries via
+    team_state (ids + previews) then get_entry(id). This is the primary read."""
     return svc.status_board(now=datetime.now(timezone.utc), soften_caps=True,
-                            include_overflow_ids=False)
+                            include_overflow_ids=False, pin_types=("decision",))
 
 
 @mcp.tool()
@@ -155,11 +156,12 @@ def overview() -> dict:
     the verbatim board when the gist model is disabled (enable with CTX_GIST=1 on
     the dev machine). Returns {overview, shown, overflow, selector}."""
     board_opts = {"now": datetime.now(timezone.utc), "soften_caps": True,
-                  "include_overflow_ids": False}
+                  "include_overflow_ids": False, "pin_types": ("decision",)}
     if not GIST_ENABLED:
         return svc.overview(**board_opts)  # deterministic verbatim board — always works
     try:
-        return svc.overview(compactor=_get_compactor(), include_overflow_ids=False)
+        return svc.overview(compactor=_get_compactor(), include_overflow_ids=False,
+                            pin_types=("decision",))
     except Exception as e:  # never take the server down for a model hiccup
         res = svc.overview(**board_opts)
         res["gist_error"] = f"{type(e).__name__}: {e}"

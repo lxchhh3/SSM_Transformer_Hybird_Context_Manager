@@ -20,6 +20,7 @@ always exact store text, so the model's drift can never reach the board.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any, Callable, Optional
 
 Entry = dict[str, Any]
@@ -157,13 +158,65 @@ def select_salient(active: list[Entry], pick: Picker,
     return pool[:cap_entries]
 
 
+def _relative_age(created_ts: Optional[str], now: datetime) -> str:
+    """Compact human age of an entry: 'just now' / '2m ago' / '5h ago' / '3d ago'.
+    Empty (rendered as no marker) when there's no ts or it won't parse — the board
+    must never crash on a bad/legacy timestamp."""
+    if not created_ts:
+        return ""
+    try:
+        secs = (now - datetime.fromisoformat(created_ts)).total_seconds()
+    except (TypeError, ValueError):  # unparseable ts, or aware/naive mismatch
+        return ""
+    secs = max(0.0, secs)
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h ago"
+    return f"{int(secs // 86400)}d ago"
+
+
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'\-]*")
+
+
+def _is_shouty(tok: str) -> bool:
+    """A long ALL-CAPS emphasis word (LANDED, PASSED, LOAD-BEARING) — NOT a real
+    acronym/identifier. Conservative on purpose: preserve anything <=4 letters
+    (SSM, TC, GATE, BC) or carrying a digit (M5, 500food); a lowercase letter
+    already excludes it (AoW, DAgger)."""
+    letters = [c for c in tok if c.isalpha()]
+    return (len(letters) >= 5 and all(c.isupper() for c in letters)
+            and not any(c.isdigit() for c in tok))
+
+
+def _soften_caps(text: str) -> str:
+    """Display-only: down-case shouty emphasis words so a bullet isn't a wall of
+    caps, while every real acronym is preserved (see `_is_shouty`). The STORE stays
+    verbatim (lesson #4) — this only touches the rendered board string."""
+    out = _WORD_RE.sub(
+        lambda m: m.group(0).lower() if _is_shouty(m.group(0)) else m.group(0), text)
+    # if we softened the sentence's opening word, keep it sentence-capitalized
+    if out != text and out[:1].islower() and text[:1].isupper():
+        out = out[:1].upper() + out[1:]
+    return out
+
+
 def render_board(
     entries: list[Entry],
     project_of: Callable[[Entry], str] = project_of,
+    now: Optional[datetime] = None,
+    soften_caps: bool = False,
 ) -> str:
     """Verbatim, structured status board. Bullets are exact store bodies; the
     driver is named in the header; a bullet is author-tagged only when its author
-    is not the project driver (exact attribution, straight from the store)."""
+    is not the project driver (exact attribution, straight from the store).
+
+    Presentation-only options (default OFF -> byte-verbatim, so the pure path and
+    its tests are unchanged): `now` adds a relative-age marker per entry (needs
+    `created_ts` on the entry); `soften_caps` down-cases shouty emphasis words.
+    Neither alters a fact — numbers, names and acronyms are preserved."""
     groups: dict[str, list[Entry]] = {}
     for e in entries:
         groups.setdefault(project_of(e), []).append(e)
@@ -180,6 +233,9 @@ def render_board(
         lines.append(f"## {name} — {driver} driving")
         for e in proj_entries:
             tag = "" if e["author"] == driver else f" ({e['author']})"
-            lines.append(f"- [{e['type']}]{tag} {e['body']}")
+            age = _relative_age(e.get("created_ts"), now) if now is not None else ""
+            age_s = f" ({age})" if age else ""
+            body = _soften_caps(e["body"]) if soften_caps else e["body"]
+            lines.append(f"- [{e['type']}]{tag}{age_s} {body}")
         lines.append("")
     return "\n".join(lines).rstrip()

@@ -11,6 +11,7 @@ Run on the dev machine (call the env python directly — `conda run` buffers std
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -84,8 +85,10 @@ def status_board() -> dict:
     """WHERE ARE WE — the current team state as a verbatim board, grouped by
     project with the driver named. Call this at the start of a session, or any
     time you need the clean current picture (superseded/reverted work already
-    removed). Returns {board, shown, overflow}. This is the primary read."""
-    return svc.status_board()
+    removed). Each bullet carries a relative age (e.g. '3d ago') and long ALL-CAPS
+    emphasis is softened for skimmability — facts (numbers/names/acronyms) are
+    unchanged. Returns {board, shown, overflow}. This is the primary read."""
+    return svc.status_board(now=datetime.now(timezone.utc), soften_caps=True)
 
 
 @mcp.tool()
@@ -108,8 +111,10 @@ def revert(entry_id: str) -> dict:
 @mcp.tool()
 def team_state() -> dict:
     """Where are we: active entries grouped by author -> type, plus the current
-    cross-author file collisions."""
-    return svc.team_state()
+    cross-author file collisions. Bodies are trimmed to a preview (with `body_len`
+    and a per-author `totals` matrix) so the full active set can't overflow the
+    read — drill into `status_board` for full board text."""
+    return svc.team_state(preview=True)
 
 
 @mcp.tool()
@@ -119,9 +124,12 @@ def check_overlap(refs: list[str], author: Optional[str] = None) -> list:
 
 
 @mcp.tool()
-def recent(since_seq: int = 0) -> list:
-    """Event stream since a sequence number — poll for the other dev's activity."""
-    return svc.recent(since_seq=since_seq)
+def recent(since_seq: int = 0, limit: int = 50) -> dict:
+    """Event stream since a sequence number — poll for the other dev's activity.
+    Returns the newest `limit` events with bodies trimmed to a preview (the raw
+    stream overflows the read); omitted older events are surfaced in `note`, and
+    `latest_seq` is the watermark to pass next. Page by raising `limit`."""
+    return svc.recent_summary(since_seq=since_seq, limit=limit)
 
 
 @mcp.tool()
@@ -131,12 +139,13 @@ def overview() -> dict:
     compress or omit): drill into `status_board` for the exact set. Falls back to
     the verbatim board when the gist model is disabled (enable with CTX_GIST=1 on
     the dev machine). Returns {overview, shown, overflow, selector}."""
+    board_opts = {"now": datetime.now(timezone.utc), "soften_caps": True}
     if not GIST_ENABLED:
-        return svc.overview()  # deterministic verbatim board — always works
+        return svc.overview(**board_opts)  # deterministic verbatim board — always works
     try:
         return svc.overview(compactor=_get_compactor())
     except Exception as e:  # never take the server down for a model hiccup
-        res = svc.overview()
+        res = svc.overview(**board_opts)
         res["gist_error"] = f"{type(e).__name__}: {e}"
         return res
 

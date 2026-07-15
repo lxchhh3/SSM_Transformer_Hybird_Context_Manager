@@ -8,11 +8,19 @@ cheap path always works and needs no model.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Optional
 
 from ctx.index import (CAP_ENTRIES, CAP_TOKENS, render_board, select_salient,
                        working_set)
 from ctx.store import Store
+
+
+def _preview(body: str, n: int) -> str:
+    """Collapse whitespace and cap a body to n chars (ellipsis if cut) — the
+    bounded-read primitive so team_state/recent can't blow the token budget."""
+    s = " ".join(body.split())
+    return s if len(s) <= n else s[:n - 1] + "…"
 
 
 class ContextService:
@@ -82,31 +90,71 @@ class ContextService:
                                 "shared_refs": shared})
         return out
 
-    def team_state(self) -> dict[str, Any]:
-        """Structured 'where are we' digest: active entries by author -> type."""
+    def team_state(self, preview: bool = False,
+                   body_chars: int = 220) -> dict[str, Any]:
+        """Structured 'where are we' digest: active entries by author -> type.
+
+        `preview=True` (what the MCP tool uses) trims each body to `body_chars`,
+        keeps the true length, and adds a `totals` count matrix — the whole active
+        set is otherwise 70KB+ and overflows the read. Default is raw/unchanged for
+        existing callers."""
         by_author: dict[str, dict[str, list]] = {}
+        totals: dict[str, dict[str, int]] = {}
         for e in self.store.active_entries():
-            by_author.setdefault(e["author"], {}).setdefault(e["type"], []).append(e)
-        return {"by_author": by_author, "overlaps": self.overlaps()}
+            if preview:
+                t = totals.setdefault(e["author"], {})
+                t[e["type"]] = t.get(e["type"], 0) + 1
+                item: dict[str, Any] = {
+                    "entry_id": e["entry_id"], "author": e["author"],
+                    "type": e["type"], "project": e["project"],
+                    "created_seq": e["created_seq"], "refs": e["refs"],
+                    "body_len": len(e["body"]),
+                    "body": _preview(e["body"], body_chars),
+                }
+            else:
+                item = e
+            by_author.setdefault(e["author"], {}).setdefault(e["type"], []).append(item)
+        res: dict[str, Any] = {"by_author": by_author, "overlaps": self.overlaps()}
+        if preview:
+            res["totals"] = totals
+            res["preview"] = True
+        return res
+
+    def _attach_ts(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Stamp each entry with its creating event's `created_ts` (from the event
+        log) so the board can show a relative age. Entry dicts are fresh per read,
+        so this in-place stamp is safe."""
+        ts_map = self.store.ts_by_seq([e.get("created_seq") for e in entries])
+        for e in entries:
+            e["created_ts"] = ts_map.get(e.get("created_seq"))
+        return entries
 
     def status_board(self, cap_entries: int = CAP_ENTRIES,
                      cap_tokens: Optional[int] = None,
                      measure: Optional[Any] = None,
-                     pick: Optional[Any] = None) -> dict[str, Any]:
+                     pick: Optional[Any] = None,
+                     now: Optional[datetime] = None,
+                     soften_caps: bool = False) -> dict[str, Any]:
         """The 'SSM selects, store renders' board — always VERBATIM store text.
 
         When the active set overflows the envelope AND a `pick` (SSM salience
         picker) is given, the SSM chooses the salient subset (map-reduce, then
         match-back to real entries). Otherwise the deterministic recency cap runs.
         `overflow` is surfaced, never silently dropped — those entries stay in the
-        store for exact recall."""
+        store for exact recall.
+
+        `now`/`soften_caps` are presentation-only (the MCP tool and the hook pass
+        them): add a relative-age marker and down-case shouty emphasis. Default OFF
+        keeps the library call byte-verbatim."""
         active = self.store.active_entries()
         if pick is not None and len(active) > cap_entries:
             selected = select_salient(active, pick, cap_entries=cap_entries)
             sel_ids = {e["entry_id"] for e in selected}
             dropped = [e for e in active if e["entry_id"] not in sel_ids]
             return {
-                "board": render_board(selected), "shown": len(selected),
+                "board": render_board(self._attach_ts(selected), now=now,
+                                      soften_caps=soften_caps),
+                "shown": len(selected),
                 "overflow": len(dropped),
                 "overflow_ids": [e["entry_id"] for e in dropped],
                 "selector": "ssm",
@@ -114,7 +162,8 @@ class ContextService:
         ws = working_set(active, cap_entries=cap_entries,
                          cap_tokens=cap_tokens, measure=measure)
         return {
-            "board": render_board(ws["kept"]),
+            "board": render_board(self._attach_ts(ws["kept"]), now=now,
+                                  soften_caps=soften_caps),
             "shown": len(ws["kept"]),
             "overflow": len(ws["dropped"]),
             "overflow_ids": [e["entry_id"] for e in ws["dropped"]],
@@ -124,7 +173,9 @@ class ContextService:
     def overview(self, compactor: Optional[Any] = None,
                  cap_entries: int = CAP_ENTRIES,
                  cap_tokens: Optional[int] = None,
-                 measure: Optional[Any] = None) -> dict[str, Any]:
+                 measure: Optional[Any] = None,
+                 now: Optional[datetime] = None,
+                 soften_caps: bool = False) -> dict[str, Any]:
         """Lossy linked 'where are we' gist over the CAPPED working set.
 
         `compactor` is a HybridCompactor (or any object with `.compact(entries)`);
@@ -132,19 +183,56 @@ class ContextService:
         read always works GPU-free. Capping first keeps the compactor's input
         bounded (so a hybrid's KV stays bounded — memory hybrid-compaction-gist),
         and the overflow is surfaced, never hidden: those entries stay in the store
-        for exact recall."""
+        for exact recall.
+
+        On the board fallback a `note` states plainly that this IS the authoritative
+        verbatim board (identical to status_board), not a lossy summary awaiting a
+        model — the gist layer is archived (research/SSM_POSTMORTEM.md)."""
         active = self.store.active_entries()
         ws = working_set(active, cap_entries=cap_entries, cap_tokens=cap_tokens,
                          measure=measure)
         kept = ws["kept"]
+        res: dict[str, Any] = {"shown": len(kept), "overflow": len(ws["dropped"]),
+                               "overflow_ids": [e["entry_id"] for e in ws["dropped"]]}
         if compactor is None:
-            text, selector = render_board(kept), "board"
+            res["overview"] = render_board(self._attach_ts(kept), now=now,
+                                           soften_caps=soften_caps)
+            res["selector"] = "board"
+            res["note"] = ("gist layer archived (research/SSM_POSTMORTEM.md) — this "
+                           "IS the authoritative verbatim board, identical to "
+                           "status_board, not a lossy summary awaiting a model.")
         else:
-            text, selector = compactor.compact(kept), "gist"
-        return {"overview": text, "shown": len(kept),
-                "overflow": len(ws["dropped"]),
-                "overflow_ids": [e["entry_id"] for e in ws["dropped"]],
-                "selector": selector}
+            res["overview"] = compactor.compact(kept)
+            res["selector"] = "gist"
+        return res
+
+    def recent_summary(self, since_seq: int = 0, limit: int = 50,
+                       body_chars: int = 220) -> dict[str, Any]:
+        """Bounded `recent`: the newest `limit` events since `since_seq`, with
+        bodies trimmed — the raw stream is 70KB+ and overflows the read. Omitted
+        (older) events are surfaced with a `note`, never silently dropped (#11);
+        page them by re-querying with a larger limit. `latest_seq` is the watermark
+        to advance to."""
+        events = self.store.events_since(since_seq)
+        total = len(events)
+        shown = events[-limit:] if (limit and total > limit) else events
+        trimmed = []
+        for e in shown:
+            p = dict(e["payload"])
+            if p.get("body"):
+                p["body"] = _preview(p["body"], body_chars)
+            trimmed.append({**e, "payload": p})
+        omitted = total - len(shown)
+        res: dict[str, Any] = {
+            "events": trimmed, "returned": len(shown), "total": total,
+            "omitted": omitted, "since_seq": since_seq,
+            "latest_seq": shown[-1]["seq"] if shown else since_seq,
+        }
+        if omitted:
+            res["note"] = (f"{omitted} older new events not shown; "
+                           f"call recent_summary(since_seq={since_seq}, "
+                           f"limit={total}) for all.")
+        return res
 
     def project_digests(self, engine: Any) -> dict[str, Any]:
         """Per-project streaming SSM digests. `engine` is a ShardedSSMEngine; this

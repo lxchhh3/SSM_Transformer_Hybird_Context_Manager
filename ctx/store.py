@@ -167,6 +167,20 @@ class Store:
     def all_events(self) -> list[dict[str, Any]]:
         return self.events_since(0)
 
+    def ts_by_seq(self, seqs: list[int]) -> dict[int, str]:
+        """Map event seqs -> their wall-clock ts. Entries carry `created_seq` but
+        no timestamp of their own (the ts lives on the creating event); this is the
+        join the board uses to show a relative age per entry. Missing seqs are
+        simply absent from the result."""
+        uniq = [s for s in dict.fromkeys(seqs) if s is not None]
+        if not uniq:
+            return {}
+        qs = ",".join("?" * len(uniq))
+        rows = self.conn.execute(
+            f"SELECT seq, ts FROM events WHERE seq IN ({qs})", uniq
+        )
+        return {int(r["seq"]): r["ts"] for r in rows}
+
     def max_seq(self) -> int:
         """Current tip of the event log — the watermark primitive for streams."""
         cur = self.conn.execute("SELECT COALESCE(MAX(seq), 0) FROM events")

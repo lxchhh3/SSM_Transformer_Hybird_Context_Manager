@@ -87,8 +87,11 @@ def status_board() -> dict:
     time you need the clean current picture (superseded/reverted work already
     removed). Each bullet carries a relative age (e.g. '3d ago') and long ALL-CAPS
     emphasis is softened for skimmability — facts (numbers/names/acronyms) are
-    unchanged. Returns {board, shown, overflow}. This is the primary read."""
-    return svc.status_board(now=datetime.now(timezone.utc), soften_caps=True)
+    unchanged. Returns {board, shown, overflow}; `overflow` is a COUNT — reach
+    the older entries via team_state (ids + previews) then get_entry(id).
+    This is the primary read."""
+    return svc.status_board(now=datetime.now(timezone.utc), soften_caps=True,
+                            include_overflow_ids=False)
 
 
 @mcp.tool()
@@ -109,12 +112,24 @@ def revert(entry_id: str) -> dict:
 
 
 @mcp.tool()
-def team_state() -> dict:
+def team_state(limit: int = 50) -> dict:
     """Where are we: active entries grouped by author -> type, plus the current
-    cross-author file collisions. Bodies are trimmed to a preview (with `body_len`
-    and a per-author `totals` matrix) so the full active set can't overflow the
-    read — drill into `status_board` for full board text."""
-    return svc.team_state(preview=True)
+    cross-author file collisions. Bounded read: the newest `limit` entries are
+    listed (bodies trimmed to a preview with `body_len`, refs capped with
+    `refs_omitted`), older ones are counted in `omitted` + a note — raise `limit`
+    to page. The `totals` matrix always counts the whole active set. Drill into
+    get_entry(id) for one entry verbatim, status_board for the board text."""
+    return svc.team_state(preview=True, limit=limit)
+
+
+@mcp.tool()
+def get_entry(entry_id: str) -> dict:
+    """Read ONE entry VERBATIM by its entry_id — full 32-hex id or a unique
+    prefix (>= 6 chars). The drill-down for ids surfaced by team_state,
+    check_overlap, or overlaps. Returns the full body, refs, type, project,
+    status (active/superseded/reverted), created_ts, and supersedes link;
+    {"error": ...} (plus `matches` on an ambiguous prefix) on a miss."""
+    return svc.get_entry(entry_id)
 
 
 @mcp.tool()
@@ -139,11 +154,12 @@ def overview() -> dict:
     compress or omit): drill into `status_board` for the exact set. Falls back to
     the verbatim board when the gist model is disabled (enable with CTX_GIST=1 on
     the dev machine). Returns {overview, shown, overflow, selector}."""
-    board_opts = {"now": datetime.now(timezone.utc), "soften_caps": True}
+    board_opts = {"now": datetime.now(timezone.utc), "soften_caps": True,
+                  "include_overflow_ids": False}
     if not GIST_ENABLED:
         return svc.overview(**board_opts)  # deterministic verbatim board — always works
     try:
-        return svc.overview(compactor=_get_compactor())
+        return svc.overview(compactor=_get_compactor(), include_overflow_ids=False)
     except Exception as e:  # never take the server down for a model hiccup
         res = svc.overview(**board_opts)
         res["gist_error"] = f"{type(e).__name__}: {e}"

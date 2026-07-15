@@ -145,6 +145,17 @@ class Store:
             raise KeyError(entry_id)
         return e
 
+    def entries_by_prefix(self, prefix: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Entries (any status) whose id starts with `prefix` — the short-id
+        resolver behind get_entry. Parameterized LIKE; ids are hex so no wildcard
+        escaping is needed, and a stray %/_ in user input just matches nothing
+        harmful (read-only)."""
+        rows = self.conn.execute(
+            "SELECT * FROM entries WHERE entry_id LIKE ? ORDER BY created_seq "
+            "LIMIT ?", (prefix + "%", limit),
+        )
+        return [self._row_to_entry(r) for r in rows]
+
     def active_entries(self, author: Optional[str] = None,
                        etype: Optional[str] = None) -> list[dict[str, Any]]:
         sql = "SELECT * FROM entries WHERE status = 'active'"

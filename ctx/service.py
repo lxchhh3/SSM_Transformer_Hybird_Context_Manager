@@ -91,26 +91,42 @@ class ContextService:
         return out
 
     def team_state(self, preview: bool = False,
-                   body_chars: int = 220) -> dict[str, Any]:
+                   body_chars: int = 220,
+                   limit: Optional[int] = None,
+                   max_refs: int = 4) -> dict[str, Any]:
         """Structured 'where are we' digest: active entries by author -> type.
 
-        `preview=True` (what the MCP tool uses) trims each body to `body_chars`,
-        keeps the true length, and adds a `totals` count matrix — the whole active
-        set is otherwise 70KB+ and overflows the read. Default is raw/unchanged for
-        existing callers."""
-        by_author: dict[str, dict[str, list]] = {}
+        `preview=True` (what the MCP tool uses) trims each body to `body_chars`
+        (true length kept in `body_len`), caps refs at `max_refs` (rest counted in
+        `refs_omitted`), and adds a `totals` count matrix. `limit` bounds the
+        LISTED entries (newest by created_seq kept; older ones counted in
+        `omitted` + a note, never silent) so the read stays bounded for ANY
+        active-set size — 220-char previews alone still hit 76KB at 117 entries.
+        `totals` always counts the WHOLE active set. Default is raw/unchanged for
+        existing library callers."""
+        active = self.store.active_entries()  # created_seq ascending
         totals: dict[str, dict[str, int]] = {}
-        for e in self.store.active_entries():
-            if preview:
+        if preview:
+            for e in active:
                 t = totals.setdefault(e["author"], {})
                 t[e["type"]] = t.get(e["type"], 0) + 1
+        omitted = 0
+        if preview and limit and len(active) > limit:
+            omitted = len(active) - limit
+            active = active[-limit:]  # newest kept
+        by_author: dict[str, dict[str, list]] = {}
+        for e in active:
+            if preview:
+                refs = e["refs"]
                 item: dict[str, Any] = {
                     "entry_id": e["entry_id"], "author": e["author"],
                     "type": e["type"], "project": e["project"],
-                    "created_seq": e["created_seq"], "refs": e["refs"],
+                    "created_seq": e["created_seq"], "refs": refs[:max_refs],
                     "body_len": len(e["body"]),
                     "body": _preview(e["body"], body_chars),
                 }
+                if len(refs) > max_refs:
+                    item["refs_omitted"] = len(refs) - max_refs
             else:
                 item = e
             by_author.setdefault(e["author"], {}).setdefault(e["type"], []).append(item)
@@ -118,7 +134,34 @@ class ContextService:
         if preview:
             res["totals"] = totals
             res["preview"] = True
+            if omitted:
+                res["omitted"] = omitted
+                res["note"] = (f"{omitted} older active entries not listed "
+                               f"(limit={limit}, newest kept; totals count "
+                               f"everything). Raise limit to page, or "
+                               f"get_entry(id) for one entry verbatim.")
         return res
+
+    def get_entry(self, entry_id: str) -> dict[str, Any]:
+        """Read ONE entry VERBATIM by full id or unique prefix (>= 6 chars) —
+        the drill-down that makes ids surfaced by team_state/check_overlap
+        actionable. Never raises on a miss: returns {"error": ...} (plus
+        `matches` when a prefix is ambiguous) so the MCP edge stays friendly."""
+        try:
+            e = self.store.get_entry(entry_id)
+        except KeyError:
+            if len(entry_id) < 6:
+                return {"error": f"no entry with id {entry_id!r} "
+                                 "(prefix lookup needs >= 6 chars)"}
+            matches = self.store.entries_by_prefix(entry_id)
+            if not matches:
+                return {"error": f"no entry matches {entry_id!r}"}
+            if len(matches) > 1:
+                return {"error": f"ambiguous prefix {entry_id!r}",
+                        "matches": [m["entry_id"] for m in matches]}
+            e = matches[0]
+        self._attach_ts([e])
+        return e
 
     def _attach_ts(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Stamp each entry with its creating event's `created_ts` (from the event
@@ -134,7 +177,8 @@ class ContextService:
                      measure: Optional[Any] = None,
                      pick: Optional[Any] = None,
                      now: Optional[datetime] = None,
-                     soften_caps: bool = False) -> dict[str, Any]:
+                     soften_caps: bool = False,
+                     include_overflow_ids: bool = True) -> dict[str, Any]:
         """The 'SSM selects, store renders' board — always VERBATIM store text.
 
         When the active set overflows the envelope AND a `pick` (SSM salience
@@ -145,37 +189,44 @@ class ContextService:
 
         `now`/`soften_caps` are presentation-only (the MCP tool and the hook pass
         them): add a relative-age marker and down-case shouty emphasis. Default OFF
-        keeps the library call byte-verbatim."""
+        keeps the library call byte-verbatim. `include_overflow_ids=False` (the MCP
+        edge) drops the raw id blob — the count stays, and ids are reachable via
+        team_state + get_entry."""
         active = self.store.active_entries()
         if pick is not None and len(active) > cap_entries:
             selected = select_salient(active, pick, cap_entries=cap_entries)
             sel_ids = {e["entry_id"] for e in selected}
             dropped = [e for e in active if e["entry_id"] not in sel_ids]
-            return {
+            res: dict[str, Any] = {
                 "board": render_board(self._attach_ts(selected), now=now,
                                       soften_caps=soften_caps),
                 "shown": len(selected),
                 "overflow": len(dropped),
-                "overflow_ids": [e["entry_id"] for e in dropped],
                 "selector": "ssm",
             }
+            if include_overflow_ids:
+                res["overflow_ids"] = [e["entry_id"] for e in dropped]
+            return res
         ws = working_set(active, cap_entries=cap_entries,
                          cap_tokens=cap_tokens, measure=measure)
-        return {
+        res = {
             "board": render_board(self._attach_ts(ws["kept"]), now=now,
                                   soften_caps=soften_caps),
             "shown": len(ws["kept"]),
             "overflow": len(ws["dropped"]),
-            "overflow_ids": [e["entry_id"] for e in ws["dropped"]],
             "selector": "recency",
         }
+        if include_overflow_ids:
+            res["overflow_ids"] = [e["entry_id"] for e in ws["dropped"]]
+        return res
 
     def overview(self, compactor: Optional[Any] = None,
                  cap_entries: int = CAP_ENTRIES,
                  cap_tokens: Optional[int] = None,
                  measure: Optional[Any] = None,
                  now: Optional[datetime] = None,
-                 soften_caps: bool = False) -> dict[str, Any]:
+                 soften_caps: bool = False,
+                 include_overflow_ids: bool = True) -> dict[str, Any]:
         """Lossy linked 'where are we' gist over the CAPPED working set.
 
         `compactor` is a HybridCompactor (or any object with `.compact(entries)`);
@@ -192,8 +243,9 @@ class ContextService:
         ws = working_set(active, cap_entries=cap_entries, cap_tokens=cap_tokens,
                          measure=measure)
         kept = ws["kept"]
-        res: dict[str, Any] = {"shown": len(kept), "overflow": len(ws["dropped"]),
-                               "overflow_ids": [e["entry_id"] for e in ws["dropped"]]}
+        res: dict[str, Any] = {"shown": len(kept), "overflow": len(ws["dropped"])}
+        if include_overflow_ids:
+            res["overflow_ids"] = [e["entry_id"] for e in ws["dropped"]]
         if compactor is None:
             res["overview"] = render_board(self._attach_ts(kept), now=now,
                                            soften_caps=soften_caps)
@@ -229,8 +281,10 @@ class ContextService:
             "latest_seq": shown[-1]["seq"] if shown else since_seq,
         }
         if omitted:
+            # name the registered TOOL (recent), not this service method — the
+            # note is rendered to MCP callers who can only call tool names
             res["note"] = (f"{omitted} older new events not shown; "
-                           f"call recent_summary(since_seq={since_seq}, "
+                           f"call recent(since_seq={since_seq}, "
                            f"limit={total}) for all.")
         return res
 
